@@ -373,8 +373,46 @@ class T9Predictor:
 # ---------------------------------------------------------------------------
 
 def _normalise(scores: np.ndarray) -> np.ndarray:
-    """Min-max normalise to [0, 1]; return zeros if all scores are identical."""
-    lo, hi = scores.min(), scores.max()
-    if hi - lo < 1e-9:
+    """Rank-based normalisation to [0, 1].
+
+    Each score is replaced by its fractional rank: ``rank / (n - 1)`` for
+    *n* candidates, producing values in [0, 1] where 1.0 is the highest-
+    scoring candidate and 0.0 is the lowest.  Ties receive the same rank
+    (mean of the ranks they would span).
+
+    Compared to min-max normalisation, this is:
+      - **invariant** to the raw score distribution (log-probs, cosine sims,
+        whatever) — only the relative ordering matters;
+      - **robust** to outliers — a single extreme score cannot dominate;
+      - **stable** across queries — the same relative rank always maps to
+        the same normalised value, regardless of what other candidates happen
+        to be in the set.
+
+    With a single candidate (or all-identical scores), returns all zeros so
+    the signal contributes nothing — identical behaviour to the old min-max.
+    """
+    n = len(scores)
+    if n <= 1:
         return np.zeros_like(scores)
-    return (scores - lo) / (hi - lo)
+    # argsort twice gives rank (0-based, ascending)
+    order = scores.argsort()
+    ranks = np.empty(n, dtype=np.float32)
+    ranks[order] = np.arange(n, dtype=np.float32)
+    # Handle ties: average the ranks of tied values
+    sorted_scores = scores[order]
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and sorted_scores[j] - sorted_scores[i] < 1e-12:
+            j += 1
+        if j > i + 1:
+            avg_rank = np.mean(np.arange(i, j, dtype=np.float32))
+            for idx in range(i, j):
+                ranks[order[idx]] = avg_rank
+        i = j
+    # All-identical scores → all ranks equal → return zeros (no signal)
+    denom = n - 1
+    result = ranks / denom
+    if result.max() - result.min() < 1e-9:
+        return np.zeros(n, dtype=np.float32)
+    return result

@@ -480,16 +480,42 @@ class TestT9Session:
 # ===========================================================================
 
 class TestNormalise:
-    def test_min_max(self):
+    def test_rank_based_endpoints(self):
         arr = np.array([1.0, 2.0, 3.0, 4.0])
         out = _normalise(arr)
-        assert out[0] == pytest.approx(0.0)
-        assert out[-1] == pytest.approx(1.0)
+        assert out[0] == pytest.approx(0.0)       # lowest rank
+        assert out[-1] == pytest.approx(1.0)       # highest rank
+
+    def test_rank_based_intermediate(self):
+        arr = np.array([1.0, 2.0, 3.0, 4.0])
+        out = _normalise(arr)
+        assert out[1] == pytest.approx(1.0 / 3)
+        assert out[2] == pytest.approx(2.0 / 3)
 
     def test_uniform_returns_zeros(self):
         arr = np.array([5.0, 5.0, 5.0])
         out = _normalise(arr)
         np.testing.assert_array_equal(out, 0)
+
+    def test_single_element_returns_zero(self):
+        arr = np.array([42.0])
+        out = _normalise(arr)
+        np.testing.assert_array_equal(out, 0)
+
+    def test_ties_get_average_rank(self):
+        arr = np.array([1.0, 3.0, 3.0, 5.0])
+        out = _normalise(arr)
+        # ranks: 0, 1.5, 1.5, 3 → normalised: 0, 0.5, 0.5, 1.0
+        assert out[0] == pytest.approx(0.0)
+        assert out[1] == pytest.approx(0.5)
+        assert out[2] == pytest.approx(0.5)
+        assert out[3] == pytest.approx(1.0)
+
+    def test_invariant_to_scale(self):
+        """Rank-based norm should give identical output for any monotone transform."""
+        arr1 = np.array([1.0, 2.0, 3.0, 4.0])
+        arr2 = np.array([10.0, 200.0, 3000.0, 40000.0])  # same ordering
+        np.testing.assert_allclose(_normalise(arr1), _normalise(arr2))
 
 
 # ===========================================================================

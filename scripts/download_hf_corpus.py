@@ -26,6 +26,7 @@ def main():
     parser.add_argument('--dataset', required=True, help='HuggingFace dataset identifier (e.g., owner/dataset)')
     parser.add_argument('--output', help='Output file path (default: corpuses/<dataset_name>.txt)')
     parser.add_argument('--config-name', help='Optional config name for the dataset (if applicable)')
+    parser.add_argument('--split', help='Optional split name to use (default: all splits)')
     args = parser.parse_args()
 
     # Determine output path
@@ -40,15 +41,18 @@ def main():
 
     # Load dataset
     print(f"Loading dataset: {args.dataset}")
-    if args.config_name:
-        dataset = load_dataset(args.dataset, args.config_name)
+    dataset = load_dataset(args.dataset, args.config_name, split=args.split)
+
+    # Handle single split vs multiple splits
+    if args.split:
+        splits = {args.split: dataset}
     else:
-        dataset = load_dataset(args.dataset)
+        splits = dataset
 
     # Open output file
     with open(output_path, 'w', encoding='utf-8') as f:
         # Process each split
-        for split_name, split_data in dataset.items():
+        for split_name, split_data in splits.items():
             print(f"Processing split: {split_name}")
             for example in split_data:
                 text = example['text']

@@ -13,7 +13,7 @@ Usage::
     ai-t9-train --vocab data/vocab.json --corpus corpuses/ --output data/model.npz
 
     # Also export a bigram model for the ngram signal
-    ai-t9-train --vocab data/vocab.json --output data/model.npz --save-ngram data/bigram.json
+    ai-t9-train --vocab data/vocab.json --output data/model.npz --save-ngram data/bigram.npz
 
     # Precompute pairs once (CPU job) and save for later GPU training runs:
     ai-t9-train --vocab data/vocab.json --corpus corpuses/ \\
@@ -221,8 +221,8 @@ def main(argv: list[str] | None = None) -> int:
             scorer = BigramScorer.build_from_nltk(vocab, verbose=True)
         ngram_path = Path(args.save_ngram)
         ngram_path.parent.mkdir(parents=True, exist_ok=True)
-        scorer.save(ngram_path)
-        print(f"Saved bigram model → {ngram_path}")
+        actual_ngram_path = scorer.save(ngram_path)
+        print(f"Saved bigram model → {actual_ngram_path}")
 
     return 0
 

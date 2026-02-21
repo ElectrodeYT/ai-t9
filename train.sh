@@ -1,2 +1,10 @@
 #!/bin/bash
-ai-t9-train --vocab data/vocab.json --corpus corpuses/ --output data/model.npz --save-ngram data/bigram.json --device cuda --debug
+ai-t9-train \
+	--vocab data/vocab.json \
+	--output data/model.npz \
+	--save-ngram data/bigram.npz \
+	--embed-dim 32 \
+	--device cuda \
+	--debug \
+	--load-pairs data/pairs.npz \
+	$@

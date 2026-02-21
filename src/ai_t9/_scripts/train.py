@@ -116,10 +116,27 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Print timestamped phase breakdown to diagnose startup bottlenecks",
     )
+    parser.add_argument(
+        "--model-type",
+        choices=["dual-encoder", "char-ngram"],
+        default="char-ngram",
+        help="Model architecture to train (default: char-ngram, which is more accurate but slightly slower than dual-encoder)",
+    )
     args = parser.parse_args(argv)
 
     from ai_t9.model.vocab import Vocabulary
-    from ai_t9.model.trainer import DualEncoderTrainer
+    from ai_t9.model.trainer import DualEncoderTrainer, CharNgramDualEncoderTrainer
+
+    match args.model_type:
+        case "dual-encoder":
+            print("Selected model type: DualEncoder (word-level)")
+            TrainerCls = DualEncoderTrainer
+        case "char-ngram":
+            print("Selected model type: CharNgramDualEncoder (character n-gram)")
+            TrainerCls = CharNgramDualEncoderTrainer
+        case _:
+            print(f"ERROR: unknown model type: {args.model_type}", file=sys.stderr)
+            return 1
 
     # ---- Validate flag combinations ------------------------------------
     if args.pairs_only and not args.save_pairs:
@@ -144,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  {vocab.size} words loaded")
 
     # ---- Train dual encoder ---------------------------------------------
-    trainer = DualEncoderTrainer(
+    trainer = TrainerCls(
         vocab=vocab,
         embed_dim=args.embed_dim,
         context_window=args.context_window,

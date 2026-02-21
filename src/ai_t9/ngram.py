@@ -114,6 +114,19 @@ class BigramScorer:
         self._raw_bigrams  = None
         self._raw_unigrams = None
 
+    @property
+    def n_unique_contexts(self) -> int:
+        """Number of distinct first-words (rows) that have at least one bigram entry."""
+        self._ensure_built()
+        import numpy as _np
+        return int(_np.count_nonzero(_np.diff(self._row_ptr)))  # type: ignore[arg-type]
+
+    @property
+    def n_bigram_pairs(self) -> int:
+        """Total number of stored (prev, next) bigram pairs."""
+        self._ensure_built()
+        return int(len(self._col_idx))  # type: ignore[arg-type]
+
     def _ensure_built(self) -> None:
         if not self._built:
             self._build_csr()

@@ -85,7 +85,7 @@ R2_SECRET_NAME = "r2-credentials"
 # Default training hyperparameters (mirror ai-t9-train defaults but sized up
 # for cloud GPU runs).
 DEFAULT_EPOCHS = 5
-DEFAULT_EMBED_DIM = 64
+DEFAULT_EMBED_DIM = 264
 DEFAULT_CONTEXT_WINDOW = 3
 DEFAULT_NEG_SAMPLES = 20
 DEFAULT_LR = 0.005

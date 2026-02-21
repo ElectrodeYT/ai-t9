@@ -326,10 +326,14 @@ class T9Predictor:
 
         At minimum, vocab_path and dict_path are required.
         Pass model_path and/or ngram_path to enable those signals.
+
+        The model type (DualEncoder vs CharNgramDualEncoder) is detected
+        automatically by inspecting the .npz file contents — callers do not
+        need to specify which type was trained.
         """
         vocab = Vocabulary.load(vocab_path)
         dictionary = T9Dictionary.load(dict_path, vocab)
-        model = DualEncoder.load(model_path, vocab) if model_path else None
+        model = _load_model_auto(model_path, vocab) if model_path else None
         ngram = BigramScorer.load(ngram_path, vocab) if ngram_path else None
         return cls(dictionary, model=model, ngram=ngram, **kwargs)
 
@@ -371,6 +375,15 @@ class T9Predictor:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _load_model_auto(path: "str | Path", vocab: Vocabulary) -> "DualEncoder":
+    """Load a DualEncoder or CharNgramDualEncoder by inspecting the .npz file."""
+    import numpy as np
+    arrays = np.load(str(path))
+    if "ngram_keys" in arrays:
+        from .model.char_ngram_encoder import CharNgramDualEncoder
+        return CharNgramDualEncoder.load(path, vocab)
+    return DualEncoder.load(path, vocab)
 
 def _normalise(scores: np.ndarray) -> np.ndarray:
     """Rank-based normalisation to [0, 1].

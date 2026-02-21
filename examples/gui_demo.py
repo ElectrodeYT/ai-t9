@@ -821,7 +821,7 @@ class DebugWindow(QWidget):
             ng = p._ngram
             lines.append(_kv("smoothing k", str(ng._k)))
             lines.append(_kv("vocab size", str(ng._vocab.size)))
-            lines.append(_kv("unique prev-words seen", str(len(ng._bigrams))))
+            lines.append(_kv("unique prev-words seen", str(ng.n_unique_contexts)))
 
         if p.has_model:
             lines.append("")

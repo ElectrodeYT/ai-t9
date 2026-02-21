@@ -243,7 +243,11 @@ class _TorchDualEncoder:
 # ---------------------------------------------------------------------------
 
 def _brown_sentence_ids(vocab: Vocabulary) -> list[list[int]]:
-    """Return all Brown corpus sentences as lists of word IDs."""
+    """Return all Brown corpus sentences as lists of word IDs.
+
+    UNK tokens (ID 0) are excluded so they never appear as training
+    targets or pollute context windows.
+    """
     import nltk
     try:
         nltk.data.find("corpora/brown")
@@ -251,20 +255,28 @@ def _brown_sentence_ids(vocab: Vocabulary) -> list[list[int]]:
         nltk.download("brown", quiet=True)
     from nltk.corpus import brown
     sentences = []
+    unk = vocab.UNK_ID
     for sent in brown.sents():
         ids = [vocab.word_to_id(w.lower()) for w in sent if w.isalpha()]
+        ids = [wid for wid in ids if wid != unk]
         if len(ids) >= 2:
             sentences.append(ids)
     return sentences
 
 
 def _corpus_file_sentence_ids(path: Path, vocab: Vocabulary) -> list[list[int]]:
-    """Read a plain-text file (one sentence per line) and convert to word IDs."""
+    """Read a plain-text file (one sentence per line) and convert to word IDs.
+
+    UNK tokens (ID 0) are excluded so they never appear as training
+    targets or pollute context windows.
+    """
     sentences = []
+    unk = vocab.UNK_ID
     with path.open(encoding="utf-8", errors="ignore") as f:
         for line in f:
             words = line.strip().lower().split()
             ids = [vocab.word_to_id(w) for w in words if w.isalpha()]
+            ids = [wid for wid in ids if wid != unk]
             if len(ids) >= 2:
                 sentences.append(ids)
     return sentences
@@ -279,22 +291,30 @@ def _precompute_pairs(
     Called once before training.  The resulting arrays are shuffled per epoch
     via NumPy index permutation (fast, releases the GIL).
 
+    Pairs where the target is UNK (ID 0) are skipped — they teach nothing
+    useful and waste gradient signal.  (UNK tokens should already be stripped
+    from sentences by the corpus loaders, but this is a safety net.)
+
     Returns:
         ctx_arr: int64 (n_pairs, context_window) — zero-padded on the left
         pos_arr: int64 (n_pairs,)
     """
+    _UNK = 0
     n_pairs = sum(max(0, len(s) - 1) for s in sentences)
     ctx_arr = np.zeros((n_pairs, context_window), dtype=np.int64)
     pos_arr = np.empty(n_pairs, dtype=np.int64)
     idx = 0
     for sent in sentences:
         for t in range(1, len(sent)):
+            if sent[t] == _UNK:
+                continue  # skip UNK targets
             ctx_start = max(0, t - context_window)
             src = sent[ctx_start:t]
             ctx_arr[idx, context_window - len(src):] = src
             pos_arr[idx] = sent[t]
             idx += 1
-    return ctx_arr, pos_arr
+    # Truncate to actual count (idx < n_pairs when UNK targets were skipped)
+    return ctx_arr[:idx], pos_arr[:idx]
 
 
 def _format_eta(seconds: float) -> str:

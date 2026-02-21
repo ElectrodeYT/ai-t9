@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-t9"
+version = "0.1.0"
+description = "Advanced predictive T9 text input using a custom-trainable dual-encoder model"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "nltk>=3.8",
+]
+
+[project.optional-dependencies]
+train = ["torch>=2.0"]
+dev = ["pytest>=7.0", "torch>=2.0"]
+
+[project.scripts]
+ai-t9-build-vocab = "ai_t9._scripts.build_vocab:main"
+ai-t9-train = "ai_t9._scripts.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ai_t9 = ["py.typed"]

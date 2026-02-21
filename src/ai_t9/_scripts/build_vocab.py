@@ -71,16 +71,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-words",
         type=int,
-        default=50_000,
+        default=500_000,
         metavar="N",
-        help="Maximum vocabulary size (default: 50000)",
+        help="Maximum vocabulary size (default: 500000)",
     )
     parser.add_argument(
         "--min-count",
         type=int,
-        default=2,
+        default=20,
         metavar="N",
-        help="Minimum word frequency to include (default: 2)",
+        help="Minimum word frequency to include (default: 20)",
     )
     parser.add_argument(
         "--dictionary",

@@ -176,6 +176,123 @@ class T9Predictor:
         else:
             return [words[i] for i in top_indices]
 
+    def predict_with_trace(
+        self,
+        digit_seq: str,
+        context: Sequence[str] = (),
+        top_k: int = 5,
+    ) -> "tuple[list[RankedCandidate], dict]":
+        """Like predict(return_details=True) but also returns a trace dict.
+
+        The trace dict exposes every intermediate array so that debug tooling
+        can render per-stage score breakdowns without reimplementing scoring.
+
+        Returns:
+            (ranked_candidates, trace)
+
+        Trace keys:
+            digit_seq       – the input sequence
+            context         – the context list used
+            dict_hits       – total candidates from the dictionary (before top_k)
+            candidates_raw  – list of (word, wid) in original dict order
+            freq_raw        – raw log-freq array (same order as dict_hits)
+            freq_norm       – min-max normalised freq_raw
+            model_raw       – raw model cosine-sim array, or None
+            model_norm      – normalised model_raw, or None
+            ngram_raw       – raw bigram log-prob array, or None
+            ngram_norm      – normalised ngram_raw, or None
+            final           – final blended score array
+            order           – argsort indices (descending) used for ranking
+            weights         – effective weights dict
+        """
+        if not is_valid_digit_sequence(digit_seq):
+            raise ValueError(
+                f"Invalid digit sequence {digit_seq!r}. "
+                "Use digits 2-9 only (T9 keypad)."
+            )
+
+        candidates = self._dict.lookup(digit_seq)
+        if not candidates:
+            empty_trace: dict = {
+                "digit_seq": digit_seq,
+                "context": list(context),
+                "dict_hits": 0,
+                "candidates_raw": [],
+                "freq_raw": np.array([], dtype=np.float32),
+                "freq_norm": np.array([], dtype=np.float32),
+                "model_raw": None,
+                "model_norm": None,
+                "ngram_raw": None,
+                "ngram_norm": None,
+                "final": np.array([], dtype=np.float32),
+                "order": np.array([], dtype=np.intp),
+                "weights": self.weights,
+            }
+            return [], empty_trace
+
+        words, word_ids = zip(*candidates)
+        word_ids_list = list(word_ids)
+
+        freq_raw = np.array(
+            [self._vocab.logfreq(wid) for wid in word_ids_list], dtype=np.float32
+        )
+        freq_norm = _normalise(freq_raw)
+
+        if self._model is not None and self._wm > 0:
+            ctx_ids = self._vocab.words_to_ids(list(context))
+            model_raw = self._model.score_candidates(ctx_ids, word_ids_list)
+            model_norm = _normalise(model_raw)
+        else:
+            model_raw = None
+            model_norm = None
+
+        if self._ngram is not None and self._wn > 0 and context:
+            prev_id = self._vocab.word_to_id(context[-1].lower())
+            ngram_raw = np.array(
+                self._ngram.score_candidates(prev_id, word_ids_list), dtype=np.float32
+            )
+            ngram_norm = _normalise(ngram_raw)
+        else:
+            ngram_raw = None
+            ngram_norm = None
+
+        mn = model_norm if model_norm is not None else np.zeros(len(word_ids_list), dtype=np.float32)
+        nn = ngram_norm if ngram_norm is not None else np.zeros(len(word_ids_list), dtype=np.float32)
+
+        final = self._wf * freq_norm + self._wm * mn + self._wn * nn
+        order = np.argsort(-final)
+        top_indices = order[:top_k]
+
+        ranked = [
+            RankedCandidate(
+                word=words[i],
+                word_id=word_ids_list[i],
+                freq_score=float(freq_norm[i]),
+                model_score=float(mn[i]),
+                ngram_score=float(nn[i]),
+                final_score=float(final[i]),
+            )
+            for i in top_indices
+        ]
+
+        trace: dict = {
+            "digit_seq": digit_seq,
+            "context": list(context),
+            "dict_hits": len(candidates),
+            "candidates_raw": list(zip(words, word_ids_list)),
+            "freq_raw": freq_raw,
+            "freq_norm": freq_norm,
+            "model_raw": model_raw,
+            "model_norm": model_norm,
+            "ngram_raw": ngram_raw,
+            "ngram_norm": ngram_norm,
+            "final": final,
+            "order": order,
+            "weights": self.weights,
+        }
+
+        return ranked, trace
+
     # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------

@@ -39,11 +39,15 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMainWindow,
     QPushButton,
     QSizePolicy,
     QSpinBox,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QTextBrowser,
     QToolButton,
     QVBoxLayout,
@@ -416,6 +420,472 @@ class ContextStrip(QWidget):
                 self._chips_box.addWidget(chip)
 
 
+class DebugWindow(QWidget):
+    """Live predictor debug panel — non-modal, stays open alongside the phone.
+
+    Four tabs:
+    • Scores    — per-candidate score table with visual bars for every signal
+    • Pipeline  — step-by-step trace: dict lookup → freq → model → ngram → blend
+    • Config    — predictor weights, vocabulary size, active signals
+    • Log       — rolling history of digit sequences and confirmed words
+    """
+
+    _MAX_LOG = 200  # lines
+
+    def __init__(self, predictor, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._predictor = predictor
+        self._log_lines: list[str] = []
+        self._last_trace: dict | None = None
+
+        self.setWindowTitle("ai-t9 — Predictor Debug")
+        self.setMinimumSize(660, 520)
+        self.resize(740, 580)
+        self.setWindowFlag(Qt.WindowType.Window)  # independent window
+        self.setStyleSheet(
+            f"QWidget{{background:{C['phone_bg']};color:#c8ccd8;}}"
+            f"QTabWidget::pane{{border:1px solid #2a2d3a;background:{C['phone_bg']};}}"
+            f"QTabBar::tab{{background:#13161e;color:#666;padding:5px 14px;"
+            f"border:1px solid #2a2d3a;border-bottom:none;border-radius:3px 3px 0 0;}}"
+            f"QTabBar::tab:selected{{background:{C['phone_bg']};color:#ccc;}}"
+            f"QTableWidget{{background:#0c0e14;color:#c8ccd8;gridline-color:#1e2130;"
+            f"border:1px solid #2a2d3a;font-size:12px;}}"
+            f"QHeaderView::section{{background:#13161e;color:#8890a8;"
+            f"border:1px solid #2a2d3a;padding:3px 6px;font-size:11px;}}"
+            f"QTextBrowser{{background:#0c0e14;color:#c8ccd8;"
+            f"border:1px solid #2a2d3a;font-family:'Courier New',monospace;"
+            f"font-size:12px;selection-background-color:#1a3a5a;}}"
+        )
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+
+        self._tabs = QTabWidget()
+        lay.addWidget(self._tabs)
+
+        # ── Tab 1: Scores ──────────────────────────────────────────────
+        score_w = QWidget()
+        score_lay = QVBoxLayout(score_w)
+        score_lay.setContentsMargins(6, 6, 6, 6)
+
+        hdr = QLabel("Candidate scores for current digit sequence")
+        hdr.setStyleSheet(f"color:{C['status_text']};font-size:11px;")
+        score_lay.addWidget(hdr)
+
+        self._score_table = QTableWidget(0, 6)
+        self._score_table.setHorizontalHeaderLabels(
+            ["Word", "freq (raw)", "freq ▪", "model ▪", "ngram ▪", "final ▪"]
+        )
+        self._score_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        for col in range(1, 6):
+            self._score_table.horizontalHeader().setSectionResizeMode(
+                col, QHeaderView.ResizeMode.Stretch
+            )
+        self._score_table.verticalHeader().setVisible(False)
+        self._score_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._score_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        score_lay.addWidget(self._score_table)
+
+        self._tabs.addTab(score_w, "📊  Scores")
+
+        # ── Tab 2: Pipeline ────────────────────────────────────────────
+        pipe_w = QWidget()
+        pipe_lay = QVBoxLayout(pipe_w)
+        pipe_lay.setContentsMargins(6, 6, 6, 6)
+        self._pipe_browser = QTextBrowser()
+        self._pipe_browser.setOpenLinks(False)
+        pipe_lay.addWidget(self._pipe_browser)
+        self._tabs.addTab(pipe_w, "🔬  Pipeline")
+
+        # ── Tab 3: Config ──────────────────────────────────────────────
+        cfg_w = QWidget()
+        cfg_lay = QVBoxLayout(cfg_w)
+        cfg_lay.setContentsMargins(6, 6, 6, 6)
+        self._cfg_browser = QTextBrowser()
+        self._cfg_browser.setOpenLinks(False)
+        cfg_lay.addWidget(self._cfg_browser)
+        self._tabs.addTab(cfg_w, "⚙  Config")
+
+        # ── Tab 4: Log ─────────────────────────────────────────────────
+        log_w = QWidget()
+        log_lay = QVBoxLayout(log_w)
+        log_lay.setContentsMargins(6, 6, 6, 6)
+        log_top = QHBoxLayout()
+        log_top.addStretch()
+        clr_btn = QToolButton()
+        clr_btn.setText("Clear log")
+        clr_btn.setStyleSheet(
+            "color:#665;background:#1a1a10;border:1px solid #3a3a20;"
+            "border-radius:3px;padding:2px 8px;font-size:11px;"
+        )
+        clr_btn.clicked.connect(self._clear_log)
+        log_top.addWidget(clr_btn)
+        log_lay.addLayout(log_top)
+        self._log_browser = QTextBrowser()
+        self._log_browser.setOpenLinks(False)
+        log_lay.addWidget(self._log_browser)
+        self._tabs.addTab(log_w, "📜  Log")
+
+        # Populate config tab once (static)
+        self._render_config()
+
+    # ── Public update entry point ──────────────────────────────────────
+
+    def update_trace(
+        self,
+        trace: dict | None,
+        context: list[str],
+        mode: str,
+        digit_buf: str,
+        committed: str,
+    ) -> None:
+        """Called by T9PhoneWindow._refresh() whenever state changes."""
+        self._last_trace = trace
+        self._render_scores(trace)
+        self._render_pipeline(trace, context, mode, digit_buf, committed)
+
+    def append_log(self, entry: str) -> None:
+        self._log_lines.append(entry)
+        if len(self._log_lines) > self._MAX_LOG:
+            self._log_lines = self._log_lines[-self._MAX_LOG:]
+        self._render_log()
+
+    # ── Tab renderers ──────────────────────────────────────────────────
+
+    def _render_scores(self, trace: dict | None) -> None:
+        if not trace or trace["dict_hits"] == 0:
+            self._score_table.setRowCount(0)
+            return
+
+        words_raw = trace["candidates_raw"]
+        freq_raw  = trace["freq_raw"]
+        freq_norm = trace["freq_norm"]
+        model_norm = trace["model_norm"]
+        ngram_norm = trace["ngram_norm"]
+        final      = trace["final"]
+        order      = trace["order"]
+        n = len(words_raw)
+
+        self._score_table.setRowCount(n)
+        for rank, i in enumerate(order):
+            if i >= n:
+                continue
+            word = words_raw[i][0]
+
+            # Word cell — bold if rank 0
+            wi = QTableWidgetItem(word)
+            if rank == 0:
+                wi.setForeground(QColor(C["display_active"]))
+                font = wi.font()
+                font.setBold(True)
+                wi.setFont(font)
+            else:
+                wi.setForeground(QColor(C["cand_text"]))
+            self._score_table.setItem(rank, 0, wi)
+
+            # freq raw (log-prob)
+            self._score_table.setItem(
+                rank, 1,
+                self._num_item(float(freq_raw[i]), fmt=".4f", color="#8890a8")
+            )
+            # freq normalised bar
+            self._score_table.setItem(
+                rank, 2,
+                self._bar_item(float(freq_norm[i]), "#4488cc")
+            )
+            # model bar
+            mv = float(model_norm[i]) if model_norm is not None else -1.0
+            self._score_table.setItem(
+                rank, 3,
+                self._bar_item(mv, "#cc8844") if mv >= 0 else self._na_item()
+            )
+            # ngram bar
+            nv = float(ngram_norm[i]) if ngram_norm is not None else -1.0
+            self._score_table.setItem(
+                rank, 4,
+                self._bar_item(nv, "#44aa77") if nv >= 0 else self._na_item()
+            )
+            # final bar
+            self._score_table.setItem(
+                rank, 5,
+                self._bar_item(float(final[i]), C["display_active"])
+            )
+
+    def _render_pipeline(self, trace, context, mode, digit_buf, committed) -> None:
+        lines: list[str] = []
+
+        def _h(title: str, color: str = C["display_active"]) -> str:
+            return (
+                f'<span style="color:{color};font-weight:bold;font-size:13px">'
+                f'── {title} ──</span>'
+            )
+
+        def _kv(k: str, v: str, vc: str = "#c8ccd8") -> str:
+            return (
+                f'<span style="color:{C["status_text"]}">{k}:</span>&nbsp;'
+                f'<span style="color:{vc}">{v}</span>'
+            )
+
+        def _bar_html(value: float, color: str, width: int = 120) -> str:
+            px = max(2, int(value * width))
+            return (
+                f'<span style="display:inline-block;'
+                f'background:{color};width:{px}px;height:8px;""></span>'
+                f'&nbsp;<span style="color:#888">{value:.3f}</span>'
+            )
+
+        # ── 0. Session state ──────────────────────────────────────────
+        lines.append(_h("Session state"))
+        lines.append(_kv("mode", mode,
+                         C["mode_T9"] if mode == "T9" else C["mode_ABC"]))
+        lines.append(_kv("committed",
+                         f"{repr(committed[:40])}" + ("…" if len(committed) > 40 else ""),
+                         "#9898b8"))
+        ctx_str = (
+            "[" + ", ".join(f"<i>{w}</i>" for w in context) + "]"
+            if context else "<i>(empty)</i>"
+        )
+        lines.append(_kv("context", ctx_str))
+        lines.append("")
+
+        if not trace or trace["dict_hits"] == 0:
+            if digit_buf:
+                lines.append(_h("Stage 1 · dictionary lookup", "#cc8844"))
+                lines.append(_kv("digit_seq", digit_buf or "(none)"))
+                lines.append('<span style="color:#884444">No matches in dictionary.</span>')
+            else:
+                lines.append('<span style="color:#565a6e">No active digit sequence.</span>')
+            self._pipe_browser.setHtml(self._wrap_html("<br>".join(lines)))
+            return
+
+        words_raw = trace["candidates_raw"]
+        n = len(words_raw)
+
+        # ── 1. Dictionary lookup ──────────────────────────────────────
+        lines.append(_h("Stage 1 · dictionary lookup"))
+        lines.append(_kv("digit_seq",
+                         f'<b style="color:{C["display_active"]}">{trace["digit_seq"]}</b>'))
+        lines.append(_kv("total matches", str(n), C["cand_text"]))
+        sample = ", ".join(w for w, _ in words_raw[:8])
+        if n > 8:
+            sample += f" … (+{n - 8} more)"
+        lines.append(_kv("words (freq order)", sample, "#8890a8"))
+        lines.append("")
+
+        # ── 2. Frequency scoring ──────────────────────────────────────
+        lines.append(_h("Stage 2 · frequency score", "#4488cc"))
+        lines.append(
+            _kv("weight",
+                f'{trace["weights"]["freq"]:.3f}',
+                C["cand_text"] if trace["weights"]["freq"] > 0 else C["status_text"])
+        )
+        lines.append("<table cellpadding='1' cellspacing='0'>")
+        order = trace["order"]
+        for rank, i in enumerate(order[:6]):
+            w, _ = words_raw[i]
+            raw  = float(trace["freq_raw"][i])
+            norm = float(trace["freq_norm"][i])
+            lines.append(
+                f"<tr>"
+                f'<td style="color:{C["cand_text"]};width:80px">{w}</td>'
+                f'<td style="color:#666;width:70px">{raw:.4f}</td>'
+                f"<td>{_bar_html(norm, '#4488cc')}</td>"
+                f"</tr>"
+            )
+        lines.append("</table>")
+        lines.append("")
+
+        # ── 3. Model scoring ──────────────────────────────────────────
+        lines.append(_h("Stage 3 · model score (dual-encoder)", "#cc8844"))
+        if trace["model_raw"] is None:
+            lines.append(
+                '<span style="color:#565a6e">Model not loaded — signal disabled.</span>'
+            )
+        else:
+            lines.append(
+                _kv("weight", f'{trace["weights"]["model"]:.3f}', C["cand_text"])
+            )
+            ctx_disp = (
+                "[" + ", ".join(trace["context"]) + "]"
+                if trace["context"] else "(empty context — zeros)"
+            )
+            lines.append(_kv("context used", ctx_disp, "#9898b8"))
+            lines.append("<table cellpadding='1' cellspacing='0'>")
+            for rank, i in enumerate(order[:6]):
+                w, _ = words_raw[i]
+                raw  = float(trace["model_raw"][i])
+                norm = float(trace["model_norm"][i])
+                lines.append(
+                    f"<tr>"
+                    f'<td style="color:{C["cand_text"]};width:80px">{w}</td>'
+                    f'<td style="color:#666;width:70px">{raw:.4f}</td>'
+                    f"<td>{_bar_html(norm, '#cc8844')}</td>"
+                    f"</tr>"
+                )
+            lines.append("</table>")
+        lines.append("")
+
+        # ── 4. Ngram scoring ──────────────────────────────────────────
+        lines.append(_h("Stage 4 · ngram score (bigram)", "#44aa77"))
+        if trace["ngram_raw"] is None:
+            reason = (
+                "Ngram not loaded — signal disabled."
+                if not self._predictor.has_ngram
+                else "No context words yet — ngram requires ≥1 prior word."
+            )
+            lines.append(f'<span style="color:#565a6e">{reason}</span>')
+        else:
+            lines.append(
+                _kv("weight", f'{trace["weights"]["ngram"]:.3f}', C["cand_text"])
+            )
+            prev = trace["context"][-1] if trace["context"] else "—"
+            lines.append(_kv("prev word (P·context)", prev, "#9898b8"))
+            lines.append("<table cellpadding='1' cellspacing='0'>")
+            for rank, i in enumerate(order[:6]):
+                w, _ = words_raw[i]
+                raw  = float(trace["ngram_raw"][i])
+                norm = float(trace["ngram_norm"][i])
+                lines.append(
+                    f"<tr>"
+                    f'<td style="color:{C["cand_text"]};width:80px">{w}</td>'
+                    f'<td style="color:#666;width:70px">{raw:.4f}</td>'
+                    f"<td>{_bar_html(norm, '#44aa77')}</td>"
+                    f"</tr>"
+                )
+            lines.append("</table>")
+        lines.append("")
+
+        # ── 5. Final blend ────────────────────────────────────────────
+        lines.append(_h("Stage 5 · final blend", C["display_active"]))
+        w = trace["weights"]
+        lines.append(
+            _kv("formula",
+                f'{w["freq"]:.3f}·freq + {w["model"]:.3f}·model '
+                f'+ {w["ngram"]:.3f}·ngram',
+                "#9898b8")
+        )
+        lines.append("<table cellpadding='1' cellspacing='0'>")
+        for rank, i in enumerate(order[:min(8, n)]):
+            word, _ = words_raw[i]
+            score = float(trace["final"][i])
+            badge = (
+                f'<b style="color:{C["display_active"]}">[#{rank+1}]</b>'
+            )
+            lines.append(
+                f"<tr>"
+                f"{badge}&nbsp;"
+                f'<td style="width:80px;color:{C["cand_text"]}">{word}</td>'
+                f"<td>{_bar_html(score, C['display_active'])}</td>"
+                f"</tr>"
+            )
+        lines.append("</table>")
+
+        self._pipe_browser.setHtml(self._wrap_html("<br>".join(lines)))
+
+    def _render_config(self) -> None:
+        p = self._predictor
+        lines: list[str] = []
+
+        def _h(t): return f'<b style="color:{C["display_active"]}">{t}</b>'
+        def _kv(k, v, vc="#c8ccd8"):
+            return (f'<span style="color:{C["status_text"]}">{k}:</span>&nbsp;'
+                    f'<span style="color:{vc}">{v}</span>')
+
+        lines.append(_h("Predictor weights (effective, normalised)"))
+        for sig, w in p.weights.items():
+            active = w > 0
+            col = C["display_active"] if active else C["status_text"]
+            icon = "●" if active else "○"
+            lines.append(_kv(f"{icon} {sig}", f"{w:.4f}", col))
+        lines.append("")
+
+        lines.append(_h("Vocabulary"))
+        lines.append(_kv("size", str(p._vocab.size), C["cand_text"]))
+        lines.append(_kv("UNK id", str(p._vocab.UNK_ID)))
+        lines.append("")
+
+        lines.append(_h("Signals"))
+        lines.append(_kv("freq",  "always enabled", "#4488cc"))
+        lines.append(_kv("model",
+                         "dual-encoder (npz)" if p.has_model else "not loaded",
+                         "#cc8844" if p.has_model else C["status_text"]))
+        lines.append(_kv("ngram",
+                         "bigram (add-k smoothed)" if p.has_ngram else "not loaded",
+                         "#44aa77" if p.has_ngram else C["status_text"]))
+        lines.append("")
+
+        if p.has_ngram:
+            lines.append(_h("Bigram scorer"))
+            ng = p._ngram
+            lines.append(_kv("smoothing k", str(ng._k)))
+            lines.append(_kv("vocab size", str(ng._vocab.size)))
+            lines.append(_kv("unique prev-words seen", str(len(ng._bigrams))))
+
+        if p.has_model:
+            lines.append("")
+            lines.append(_h("Dual-encoder model"))
+            m = p._model
+            lines.append(_kv("embed_dim", str(m.embed_dim)))
+            lines.append(_kv("dtype", str(m._ctx.dtype)))
+            lines.append(_kv("vocab size", str(m._vocab.size)))
+
+        self._cfg_browser.setHtml(self._wrap_html("<br>".join(lines)))
+
+    def _render_log(self) -> None:
+        html = "<br>".join(self._log_lines[-self._MAX_LOG:])
+        self._log_browser.setHtml(self._wrap_html(html))
+        sb = self._log_browser.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _clear_log(self) -> None:
+        self._log_lines.clear()
+        self._render_log()
+
+    # ── Helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _wrap_html(body: str) -> str:
+        return (
+            f'<html><body style="background:{C["phone_bg"]};color:#c8ccd8;'
+            f'font-family:\'Courier New\',monospace;font-size:12px;">'
+            f"{body}</body></html>"
+        )
+
+    @staticmethod
+    def _num_item(val: float, fmt: str = ".3f", color: str = "#c8ccd8") -> QTableWidgetItem:
+        item = QTableWidgetItem(f"{val:{fmt}}")
+        item.setForeground(QColor(color))
+        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return item
+
+    @staticmethod
+    def _bar_item(val: float, color: str) -> QTableWidgetItem:
+        """Cell that renders as a coloured bar using block characters."""
+        blocks = "▏▎▍▌▋▊▉█"
+        filled = max(0.0, min(1.0, val))
+        n_full = int(filled * 16)
+        fractional_idx = int((filled * 16 - n_full) * len(blocks))
+        bar = "█" * n_full
+        if n_full < 16 and fractional_idx > 0:
+            bar += blocks[fractional_idx - 1]
+        bar = bar.ljust(16, "·")
+        item = QTableWidgetItem(f"{bar}  {val:.3f}")
+        item.setForeground(QColor(color))
+        item.setFont(__import__("PyQt6.QtGui", fromlist=["QFont"]).QFont(
+            "Courier New", 11
+        ))
+        return item
+
+    @staticmethod
+    def _na_item() -> QTableWidgetItem:
+        item = QTableWidgetItem("n/a")
+        item.setForeground(QColor(C["status_text"]))
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        return item
+
+
 class SettingsDialog(QDialog):
     """Settings dialog for top-k and predictor signal info."""
 
@@ -518,6 +988,10 @@ class T9PhoneWindow(QMainWindow):
         self._cand_idx: int = 0         # currently highlighted candidate
         self._committed: str = ""       # confirmed text (words + spaces)
         self._mode: str = self._MODE_T9
+        self._last_trace: dict | None = None
+
+        # ── Debug window (non-modal, created here, shown on demand) ───
+        self._debug_win = DebugWindow(predictor)
 
         # ── Multi-tap state ───────────────────────────────────────────
         self._mt_digit: str = ""        # last digit pressed
@@ -571,6 +1045,16 @@ class T9PhoneWindow(QMainWindow):
         )
         tbar.addWidget(self._signals_lbl)
         tbar.addStretch()
+
+        dbg_btn = QToolButton()
+        dbg_btn.setText("🐛")
+        dbg_btn.setToolTip("Predictor debug panel  (Ctrl+D)")
+        dbg_btn.setStyleSheet(
+            "color:#666;background:transparent;border:none;font-size:16px;"
+        )
+        dbg_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        dbg_btn.clicked.connect(self._toggle_debug)
+        tbar.addWidget(dbg_btn)
 
         settings_btn = QToolButton()
         settings_btn.setText("⚙")
@@ -695,6 +1179,7 @@ class T9PhoneWindow(QMainWindow):
 
     def _install_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+C"), self, self._copy_to_clipboard)
+        QShortcut(QKeySequence("Ctrl+D"), self, self._toggle_debug)
 
     # ─────────────────────────────────────────────────────────────────
     # Key dispatch
@@ -760,13 +1245,19 @@ class T9PhoneWindow(QMainWindow):
     def _t9_predict(self) -> None:
         if self._digit_buf:
             try:
-                self._candidates = self._session.dial(
-                    self._digit_buf, top_k=self._top_k, return_details=True
+                self._candidates, self._last_trace = (
+                    self._predictor.predict_with_trace(
+                        self._digit_buf,
+                        context=self._session.context,
+                        top_k=self._top_k,
+                    )
                 )
             except ValueError:
                 self._candidates = []
+                self._last_trace = None
         else:
             self._candidates = []
+            self._last_trace = None
         self._refresh()
 
     def _t9_confirm(self) -> None:
@@ -780,6 +1271,12 @@ class T9PhoneWindow(QMainWindow):
         self._digit_buf = ""
         self._cand_idx = 0
         self._candidates = []
+        self._last_trace = None
+        self._debug_win.append_log(
+            f'<span style="color:{C["status_text"]}">confirm</span> '
+            f'<b style="color:{C["display_active"]}">{word}</b> '
+            f'<span style="color:#444">[ctx={self._session.context}]</span>'
+        )
 
     def _t9_backspace(self) -> None:
         if self._digit_buf:
@@ -919,6 +1416,24 @@ class T9PhoneWindow(QMainWindow):
     # Utility actions
     # ─────────────────────────────────────────────────────────────────
 
+    def _toggle_debug(self) -> None:
+        if self._debug_win.isVisible():
+            self._debug_win.hide()
+        else:
+            # Position it to the right of the phone window
+            geo = self.frameGeometry()
+            self._debug_win.move(geo.right() + 10, geo.top())
+            self._debug_win.show()
+            self._debug_win.raise_()
+            # Force an immediate render with current state
+            self._debug_win.update_trace(
+                trace=self._last_trace,
+                context=self._session.context,
+                mode=self._mode,
+                digit_buf=self._digit_buf,
+                committed=self._committed,
+            )
+
     def _clear_all(self) -> None:
         self._mt_timer.stop()
         self._digit_buf = ""
@@ -928,6 +1443,7 @@ class T9PhoneWindow(QMainWindow):
         self._mt_pending = ""
         self._mt_digit = ""
         self._mt_idx = 0
+        self._last_trace = None
         self._session.reset()
         self._refresh()
 
@@ -990,6 +1506,16 @@ class T9PhoneWindow(QMainWindow):
         self._refresh_candidate_bar()
         self._ctx_strip.set_context(self._session.context)
         self._refresh_status()
+
+        # Push live data to debug window (only if visible, for performance)
+        if self._debug_win.isVisible():
+            self._debug_win.update_trace(
+                trace=self._last_trace,
+                context=self._session.context,
+                mode=self._mode,
+                digit_buf=self._digit_buf,
+                committed=self._committed,
+            )
 
     def _refresh_candidate_bar(self) -> None:
         if self._mode == self._MODE_T9 and self._candidates:
@@ -1056,6 +1582,8 @@ class T9PhoneWindow(QMainWindow):
             self._toggle_mode()
         elif k == Qt.Key.Key_Escape:
             self._clear_all()
+        elif k == Qt.Key.Key_D and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._toggle_debug()
         elif k in _digit:
             self._on_key(_digit[k])
         else:

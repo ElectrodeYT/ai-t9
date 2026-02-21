@@ -48,3 +48,12 @@
 - Preserve lowercase/alpha filtering behavior in corpus ingestion (`isalpha()` gates in vocab/trainer scripts).
 - If changing corpus preprocessing, align with `scripts/discord_to_corpus.py` output expectation: one utterance per line, UTF-8 plain text.
 - Prefer extending existing CLIs (`src/ai_t9/_scripts/build_vocab.py`, `src/ai_t9/_scripts/train.py`) over adding new entry points.
+
+## Modal cloud training
+- The Modal app (`modal_app.py`) wraps existing CLIs via `subprocess.run` — it does **not** duplicate training logic.  Changes to the training pipeline should happen in the CLIs, not in `modal_app.py`.
+- Modal functions use a `modal.Volume` (name: `ai-t9-data`) for artifacts (vocab, pairs, model, bigrams).  `volume.commit()` after writes; `volume.reload()` before reads in separate functions.
+- CloudBucketMount (R2) is supported for read-only corpus access but is **not** used for training data (too slow for random access).  Precomputed `pairs.npz` on the Volume is the intended GPU data source.
+- The `--save-pairs` / `--load-pairs` split in `ai-t9-train` is the key design that enables the CPU-prep → GPU-train two-phase Modal workflow.  Do not merge these back into a single step.
+- The `save_pairs()` function in `trainer.py` uses a `BytesIO` buffer → sequential `open()` write to stay compatible with CloudBucketMount / Mountpoint semantics (no seeks).
+- GPU selection is passed at invocation time (`modal run modal_app.py --gpu A100`), not hard-coded.
+- Local training remains fully supported — `modal_app.py` is an optional orchestration layer, not a replacement.

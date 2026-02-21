@@ -102,6 +102,80 @@ Training options:
 | `--batch-size N` | 2048 | Pairs per batch |
 | `--device` | auto | `cuda`, `mps`, or `cpu` |
 
+### Precompute training pairs (optional)
+
+For large datasets or cloud training, you can split data preparation (CPU)
+from model training (GPU). Precomputed pairs are portable `.npz` files:
+
+```bash
+# Precompute pairs from a corpus (CPU-heavy, run once)
+ai-t9-train --vocab data/vocab.json --corpus corpuses/ \
+            --save-pairs data/pairs.npz --pairs-only
+
+# Later: train from precomputed pairs (GPU-heavy, fast startup)
+ai-t9-train --vocab data/vocab.json --load-pairs data/pairs.npz \
+            --output data/model.npz --epochs 10
+```
+
+### Cloud training with Modal (optional)
+
+Train on cloud GPUs using [Modal](https://modal.com). The Modal app wraps
+the same CLIs used locally — no code duplication.
+
+**Setup:**
+
+```bash
+pip install modal
+modal setup
+modal volume create ai-t9-data    # persistent storage for artifacts
+```
+
+**Upload corpus files to the Volume:**
+
+```bash
+# Upload local corpus files
+modal volume put ai-t9-data corpuses/ corpuses/
+
+# Or ingest a HuggingFace dataset directly on Modal (no local download)
+modal run modal_app.py --ingest wikitext \
+    --ingest-config wikitext-103-raw-v1 --ingest-filename wikitext.txt
+```
+
+**Run the full pipeline (prep → train → download):**
+
+```bash
+# Full pipeline: build vocab + pairs on CPU, train on GPU, download results
+modal run modal_app.py --use-volume-corpus --gpu L4
+
+# Override hyperparameters
+modal run modal_app.py --use-volume-corpus --gpu A100 \
+    --epochs 10 --embed-dim 128 --batch-size 8192
+
+# Skip prep if pairs are already on the Volume
+modal run modal_app.py --skip-prep --gpu H100 --epochs 20
+
+# Prep only (no training)
+modal run modal_app.py --prep-only --use-volume-corpus
+
+# Download artifacts from a previous run
+modal run modal_app.py --download-only
+
+# Long-running job (survives terminal disconnect)
+modal run --detach modal_app.py --use-volume-corpus --gpu A100 --epochs 20
+
+# List what's on the Volume
+modal run modal_app.py --list-files
+```
+
+Available GPU tiers:
+
+| Flag | VRAM | Cost | Notes |
+|------|------|------|-------|
+| `--gpu L4` | 24 GB | ~$0.60/hr | Good for iteration |
+| `--gpu A100` | 40 GB | ~$2.80/hr | Fast training |
+| `--gpu A100-80GB` | 80 GB | ~$3.70/hr | Large vocab/embed_dim |
+| `--gpu H100` | 80 GB | ~$4.50/hr | Fastest |
+
 ### Run the interactive demo
 
 ```bash
@@ -172,9 +246,39 @@ A complete setup uses four files in the `data/` directory:
 | `dict.json` | `ai-t9-build-vocab` | Digit-sequence → candidate word index |
 | `model.npz` | `ai-t9-train` | Dual-encoder context/word embeddings (NumPy) |
 | `bigram.json` | `ai-t9-train --save-ngram` | Smoothed bigram transition counts |
+| `pairs.npz` | `ai-t9-train --save-pairs` | Precomputed (context, target) training pairs |
 
 All artifacts must be built from the same vocabulary. Do not mix files from
 different builds.
+
+## S3/R2 bucket management
+
+The `ai-t9-data` CLI manages training data in any S3-compatible bucket
+(Cloudflare R2 recommended for zero egress fees):
+
+```bash
+pip install -e ".[data]"
+
+# Configure (set once in your shell profile)
+export AI_T9_S3_ENDPOINT="https://<account>.r2.cloudflarestorage.com"
+export AI_T9_S3_BUCKET="my-ai-t9-bucket"
+export AI_T9_S3_ACCESS_KEY="..."
+export AI_T9_S3_SECRET_KEY="..."
+
+# List bucket contents
+ai-t9-data ls
+ai-t9-data ls corpuses/
+
+# Upload / download artifacts
+ai-t9-data upload data/vocab.json vocab/vocab.json
+ai-t9-data download vocab/vocab.json data/vocab.json
+
+# Stream a HuggingFace dataset directly to the bucket
+ai-t9-data fetch-hf wikitext wikitext-103-raw-v1 train corpuses/wiki.txt
+
+# Stream a HuggingFace dataset to a local/mounted path (for Modal)
+ai-t9-data fetch-hf-local wikitext wikitext-103-raw-v1 train /data/corpuses/wiki.txt
+```
 
 ## Architecture
 
@@ -197,6 +301,15 @@ pytest -q
 ```
 
 Tests are fast, offline, and do not require NLTK data downloads.
+
+### Optional extras
+
+| Extra | Install | Provides |
+|-------|---------|----------|
+| `train` | `pip install -e ".[train]"` | PyTorch + tqdm for model training |
+| `data` | `pip install -e ".[data]"` | boto3 for S3/R2 bucket management |
+| `gui` | `pip install -e ".[gui]"` | PyQt6 for the phone-style GUI demo |
+| `dev` | `pip install -e ".[dev]"` | pytest + PyTorch for developing/testing |
 
 ## T9 keypad reference
 

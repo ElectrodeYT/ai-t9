@@ -13,15 +13,22 @@
   - `model.npz` (context/word embeddings),
   - `bigram.json` (smoothed bigram counts).
 - `T9Predictor.from_files()` expects matching vocab IDs across all loaded artifacts; do not mix files built from different vocabularies.
-- Unknown token semantics are fixed: `<unk>` at ID `0` (`src/ai_t9/model/vocab.py`).
+- Unknown token semantics are fixed: `<unk>` at ID `0` (`src/ai_t9/model/vocab.py`). UNK's log-frequency is `log(0.5/total)`, strictly below all real words.
+- The T9 dictionary can be **restricted to a verified wordlist** via `T9Dictionary(vocab, wordlist=...)` or the `--dictionary` CLI flag.  This decouples the candidate set from corpus quality (typos in the corpus are never surfaced if a clean wordlist is used).
+- `Vocabulary.merge_wordlist()` adds wordlist-only words at floor count (1), giving them real IDs so the model and n-gram scorer can assign them meaningful scores.
 
 ## Scoring conventions to preserve
 - Keep digit validation strict: only `2-9` are valid (`src/ai_t9/t9_map.py`).
 - Dictionary buckets are pre-sorted by descending log-frequency; treat `lookup()` ordering as meaningful (`src/ai_t9/dictionary.py`).
-- Predictor combines min-max-normalized signal arrays and renormalized weights (`src/ai_t9/predictor.py`):
-  - disabled signals must contribute zero,
-  - available signal weights are auto-renormalized.
+- Predictor combines **rank-normalized** signal arrays and renormalized weights (`src/ai_t9/predictor.py`):
+  - Rank normalization maps scores to fractional ranks `[0, 1]` — only relative ordering matters, making it invariant to raw score distributions and robust to outliers.
+  - Ties receive averaged ranks; all-identical scores return zeros.
+  - Disabled signals must contribute zero; available signal weights are auto-renormalized.
 - `BigramScorer` uses add-k smoothing (`k=0.5` default) and returns log-probabilities (`src/ai_t9/ngram.py`).
+
+## Training conventions to preserve
+- UNK tokens (ID 0) are **filtered out** of training sentence IDs in both corpus loaders (`_brown_sentence_ids`, `_corpus_file_sentence_ids`) and skipped as targets in `_precompute_pairs()`.
+- Negative sampling uses **frequency-weighted** distribution (`f^0.75`, Word2Vec-style) via `torch.multinomial`, not uniform `randint`.  UNK is excluded from negatives (weight=0).
 
 ## Developer workflows
 - Install base/dev deps: `pip install -e .` or `pip install -e ".[dev]"`.
@@ -29,6 +36,7 @@
 - Build vocab + dictionary:
   - `ai-t9-build-vocab --output data/`
   - `ai-t9-build-vocab --corpus corpuses/ --output data/`
+  - `ai-t9-build-vocab --corpus corpuses/ --dictionary wordlist.txt --output data/` (restricted to verified wordlist)
 - Train model (PyTorch extra required):
   - `pip install -e ".[train]"`
   - `ai-t9-train --vocab data/vocab.json --output data/model.npz --save-ngram data/bigram.json`

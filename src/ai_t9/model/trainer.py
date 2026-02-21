@@ -507,6 +507,40 @@ class DualEncoderTrainer:
         if is_cuda and hasattr(torch, "set_float32_matmul_precision"):
             torch.set_float32_matmul_precision("high")
 
+        # ---- Phase 4b: debug timing probe (before graph setup) ---------------
+        # Run a single eager forward+backward BEFORE CUDA graph warmup so that
+        # AccumulateGrad nodes baked into the graph during capture don't
+        # conflict with the eager backward here.  Graph setup resets the model
+        # weights and optimizer state afterwards, so this step has no effect
+        # on the trained result.
+        if self._debug:
+            debug_idx = torch.arange(
+                min(self._batch_size, n_pairs), dtype=torch.int64, device=device)
+            ctx_t = ctx_dev[debug_idx]
+            pos_t = pos_dev[debug_idx]
+            self._phase(f"  first batch on device ({len(debug_idx)} pairs)", t_ref)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                logits, labels = model.score_with_negatives(ctx_t, pos_t, torch)
+                loss = bce(logits, labels)
+            self._phase("  first forward pass done", t_ref)
+            loss.backward()
+            self._phase("  first backward pass done", t_ref)
+            optimizer.step()
+            self._phase("  first optimizer step done", t_ref)
+            del ctx_t, pos_t, logits, labels, loss, debug_idx
+            # Reset model and optimizer so this probe step has zero effect on
+            # actual training (the graph setup below also resets, but we do it
+            # here too so the probe is invisible when graphs are not used).
+            optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                torch.nn.init.xavier_uniform_(model.ctx_embed.weight)
+                torch.nn.init.xavier_uniform_(model.wrd_embed.weight)
+            for state in optimizer.state.values():
+                for v in state.values():
+                    if isinstance(v, torch.Tensor):
+                        v.zero_()
+
         # ---- Phase 5: CUDA Graph setup (optional) ----------------------------
         # Each batch iteration dispatches ~40 individual CUDA kernels through
         # Python → PyTorch dispatcher → CUDA driver.  At ~300 batches/sec
@@ -545,10 +579,14 @@ class DualEncoderTrainer:
                         loss = bce(logits, labels)
                     loss.backward()
                     optimizer.step()
+                    # Drop all references to the autograd graph immediately after
+                    # each backward.  If any of these tensors survived into the
+                    # next iteration their AccumulateGrad nodes — registered on
+                    # graph_stream during this backward — would still be alive
+                    # when the next forward builds a fresh graph, causing PyTorch
+                    # to warn about a stream mismatch on the AccumulateGrad nodes.
+                    del logits, labels, loss
             torch.cuda.current_stream().wait_stream(graph_stream)
-            # Delete autograd references so stale AccumulateGrad nodes don't
-            # interfere with graph capture.
-            del logits, labels, loss
             self._phase("CUDA graph warmup done", t_ref)
 
             # Capture the full training step into a graph on the SAME side
@@ -579,6 +617,17 @@ class DualEncoderTrainer:
                     elif isinstance(v, torch.Tensor):  # step counter
                         v.zero_()
             self._phase("model + optimizer reset after warmup", t_ref)
+
+            # Truncate training pairs to a multiple of batch_size so there is
+            # never a partial last batch.  A partial batch cannot use the CUDA
+            # graph (wrong shape), so it falls back to an eager backward — but
+            # the captured graph keeps AccumulateGrad nodes for the embedding
+            # weights alive with an internal stream reference, and any eager
+            # backward on those same weights triggers a stream-mismatch warning
+            # and can cause CUDA assert failures.  Dropping at most
+            # (batch_size - 1) pairs per epoch is negligible at this scale.
+            n_pairs = (n_pairs // self._batch_size) * self._batch_size
+            n_batches = n_pairs // self._batch_size
 
         if verbose:
             vram_mb = (ctx_dev.nbytes + pos_dev.nbytes) / 1e6
@@ -615,25 +664,7 @@ class DualEncoderTrainer:
                 idx = perm[start:end]
                 batch_len = end - start
 
-                # ---- debug: time first batch in detail (always eager) -------
-                if self._debug and b == 0 and epoch == 1:
-                    ctx_t = ctx_dev[idx]
-                    pos_t = pos_dev[idx]
-                    self._phase(f"  first batch on device ({batch_len} pairs)", t_ref)
-                    optimizer.zero_grad(set_to_none=True)
-                    with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-                        logits, labels = model.score_with_negatives(ctx_t, pos_t, torch)
-                        loss = bce(logits, labels)
-                    self._phase("  first forward pass done", t_ref)
-                    loss.backward()
-                    self._phase("  first backward pass done", t_ref)
-                    optimizer.step()
-                    self._phase("  first optimizer step done", t_ref)
-                    loss_accum += loss.detach()
-                    train_batches_done += 1
-                    continue
-                # -------------------------------------------------------------
-
+                # ---- graph replay or eager fallback -------------------------
                 if graph is not None and batch_len == self._batch_size:
                     # Graph path: gather into static buffers, replay graph.
                     # Only 3 CUDA API calls instead of ~40.
@@ -642,7 +673,9 @@ class DualEncoderTrainer:
                     graph.replay()
                     loss_accum += static_loss.detach()
                 else:
-                    # Eager fallback (last partial batch, non-CUDA, no graph).
+                    # Eager fallback (non-CUDA or no graph — never reached when
+                    # use_graph is True because n_pairs is truncated to a
+                    # multiple of batch_size above).
                     ctx_t = ctx_dev[idx]
                     pos_t = pos_dev[idx]
                     optimizer.zero_grad(set_to_none=True)

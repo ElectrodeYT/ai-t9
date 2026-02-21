@@ -10,6 +10,9 @@ Usage::
 
     # From a folder of corpus files (all *.txt files are combined)
     ai-t9-build-vocab --corpus corpuses/ --output data/
+
+    # Restrict the T9 dictionary to a verified wordlist (typo-free)
+    ai-t9-build-vocab --corpus corpuses/ --dictionary wordlist.txt --output data/
 """
 
 from __future__ import annotations
@@ -79,10 +82,20 @@ def main(argv: list[str] | None = None) -> int:
         metavar="N",
         help="Minimum word frequency to include (default: 2)",
     )
+    parser.add_argument(
+        "--dictionary",
+        metavar="FILE",
+        default=None,
+        help="Plain-text wordlist file (one word per line) to restrict the "
+             "T9 dictionary.  Only words present in this file will appear as "
+             "prediction candidates.  The vocabulary and model still use the "
+             "full corpus — this only filters the dictionary output.  Useful "
+             "for ensuring a typo-free candidate set.",
+    )
     args = parser.parse_args(argv)
 
     from ai_t9.model.vocab import Vocabulary
-    from ai_t9.dictionary import T9Dictionary
+    from ai_t9.dictionary import T9Dictionary, load_wordlist
 
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -113,8 +126,18 @@ def main(argv: list[str] | None = None) -> int:
     vocab.save(vocab_path)
     print(f"Saved vocabulary ({vocab.size} words) → {vocab_path}")
 
+    # ---- Load optional verified wordlist -----------------------------------
+    wordlist: set[str] | None = None
+    if args.dictionary:
+        dict_file = Path(args.dictionary)
+        if not dict_file.exists():
+            print(f"ERROR: dictionary file not found: {dict_file}", file=sys.stderr)
+            return 1
+        wordlist = load_wordlist(dict_file)
+        print(f"Loaded wordlist: {len(wordlist):,} verified words from {dict_file.name}")
+
     # ---- Build T9 dictionary index ----------------------------------------
-    dictionary = T9Dictionary.build(vocab, verbose=True)
+    dictionary = T9Dictionary.build(vocab, wordlist=wordlist, verbose=True)
     dict_path = out_dir / "dict.json"
     dictionary.save(dict_path)
     print(f"Saved T9 dictionary index → {dict_path}")

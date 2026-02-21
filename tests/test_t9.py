@@ -228,6 +228,69 @@ class TestT9Dictionary:
             for word, wid in tiny_dict.lookup(seq):
                 assert tiny_vocab.id_to_word(wid) == word
 
+    def test_wordlist_restricts_candidates(self, tiny_vocab: Vocabulary):
+        """When a wordlist is given, only those words should appear."""
+        wordlist = {"home", "good", "the", "a"}
+        d = T9Dictionary(tiny_vocab, wordlist=wordlist)
+        hits_4663 = [w for w, _ in d.lookup("4663")]
+        assert "home" in hits_4663
+        assert "good" in hits_4663
+        assert "gone" not in hits_4663   # not in wordlist
+        assert "hood" not in hits_4663   # not in wordlist
+
+    def test_wordlist_allows_unknown_words(self, tiny_vocab: Vocabulary):
+        """Words in the wordlist but not in the vocab should still be indexed (with UNK ID)."""
+        wordlist = {"home", "good", "xylophone"}
+        d = T9Dictionary(tiny_vocab, wordlist=wordlist)
+        # xylophone → 995674663
+        hits = d.lookup("995674663")
+        words = [w for w, _ in hits]
+        assert "xylophone" in words
+        # Its word_id should be UNK since it's not in the tiny vocab
+        for w, wid in hits:
+            if w == "xylophone":
+                assert wid == tiny_vocab.UNK_ID
+
+    def test_wordlist_none_indexes_all_vocab(self, tiny_vocab: Vocabulary):
+        """Without a wordlist, all vocab words are indexed (original behaviour)."""
+        d_all = T9Dictionary(tiny_vocab, wordlist=None)
+        d_old = T9Dictionary(tiny_vocab)
+        assert d_all.lookup("4663") == d_old.lookup("4663")
+
+
+# ===========================================================================
+# Wordlist loader tests
+# ===========================================================================
+
+class TestLoadWordlist:
+    def test_basic_loading(self, tmp_path):
+        from ai_t9.dictionary import load_wordlist
+        p = tmp_path / "words.txt"
+        p.write_text("hello\nworld\nfoo\n", encoding="utf-8")
+        wl = load_wordlist(p)
+        assert wl == {"hello", "world", "foo"}
+
+    def test_filters_non_alpha(self, tmp_path):
+        from ai_t9.dictionary import load_wordlist
+        p = tmp_path / "words.txt"
+        p.write_text("hello\ncan't\ngood\n123\n", encoding="utf-8")
+        wl = load_wordlist(p)
+        assert wl == {"hello", "good"}
+
+    def test_skips_comments_and_blanks(self, tmp_path):
+        from ai_t9.dictionary import load_wordlist
+        p = tmp_path / "words.txt"
+        p.write_text("# comment\nhello\n\nworld\n", encoding="utf-8")
+        wl = load_wordlist(p)
+        assert wl == {"hello", "world"}
+
+    def test_lowercases(self, tmp_path):
+        from ai_t9.dictionary import load_wordlist
+        p = tmp_path / "words.txt"
+        p.write_text("Hello\nWORLD\n", encoding="utf-8")
+        wl = load_wordlist(p)
+        assert wl == {"hello", "world"}
+
 
 # ===========================================================================
 # DualEncoder tests

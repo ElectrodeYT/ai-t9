@@ -177,6 +177,117 @@ class T9Predictor:
         else:
             return [words[i] for i in top_indices]
 
+    def predict_completions(
+        self,
+        digit_prefix: str,
+        context: Sequence[str] = (),
+        top_k: int = 5,
+        max_extra_digits: int = 6,
+        w_length: float = 0.30,
+        return_details: bool = False,
+    ) -> "list[str] | list[RankedCandidate]":
+        """Return top-k word completions extending the given digit prefix.
+
+        Like :meth:`predict` but searches for words *longer* than the typed
+        digits.  A **length bonus** signal favours shorter completions (fewer
+        remaining keypresses).
+
+        Scoring::
+
+            base_blend = wf * freq + wm * model + wn * ngram   # existing signals
+            final      = (1 - w_length) * base_blend + w_length * length_bonus
+
+        ``length_bonus`` is rank-normalised — the shortest completion(s) among
+        the candidates receive the highest score.  When all candidates have the
+        same extra length, the signal is zero and only the base signals decide.
+
+        Args:
+            digit_prefix:     Partial T9 digit string, e.g. ``"466"``
+            context:          Previously typed words (most recent last)
+            top_k:            Number of results to return
+            max_extra_digits: Maximum extra digits beyond the prefix to consider
+            w_length:         Weight for the completion-length bonus ∈ [0, 1).
+                              Higher values bias toward shorter completions.
+            return_details:   If True, return :class:`RankedCandidate` objects.
+
+        Returns:
+            List of word strings (default) or RankedCandidate objects.
+        """
+        if not is_valid_digit_sequence(digit_prefix):
+            raise ValueError(
+                f"Invalid digit sequence {digit_prefix!r}. "
+                "Use digits 2-9 only (T9 keypad)."
+            )
+
+        candidates = self._dict.prefix_lookup(
+            digit_prefix,
+            max_extra_digits=max_extra_digits,
+        )
+        if not candidates:
+            return []
+
+        words, word_ids, full_digits = zip(*candidates)
+        word_ids_list = list(word_ids)
+
+        # ---- freq score ------------------------------------------------
+        freq_scores = np.array(
+            [self._vocab.logfreq(wid) for wid in word_ids_list], dtype=np.float32
+        )
+        freq_scores = _normalise(freq_scores)
+
+        # ---- model score -----------------------------------------------
+        if self._model is not None and self._wm > 0:
+            ctx_ids = self._vocab.words_to_ids(list(context))
+            raw_model = self._model.score_candidates(ctx_ids, word_ids_list)
+            model_scores = _normalise(raw_model)
+        else:
+            model_scores = np.zeros(len(word_ids_list), dtype=np.float32)
+
+        # ---- ngram score -----------------------------------------------
+        if self._ngram is not None and self._wn > 0 and context:
+            prev_id = self._vocab.word_to_id(context[-1].lower())
+            raw_ngram = np.array(
+                self._ngram.score_candidates(prev_id, word_ids_list), dtype=np.float32
+            )
+            ngram_scores = _normalise(raw_ngram)
+        else:
+            ngram_scores = np.zeros(len(word_ids_list), dtype=np.float32)
+
+        # ---- completion length bonus -----------------------------------
+        # Shorter completions receive higher raw scores (negative extra digits
+        # makes short = high).  Rank normalisation produces the [0, 1] signal.
+        prefix_len = len(digit_prefix)
+        extra = np.array(
+            [len(fd) - prefix_len for fd in full_digits], dtype=np.float32
+        )
+        length_scores = _normalise(-extra)
+
+        # ---- combine ---------------------------------------------------
+        base_blend = (
+            self._wf * freq_scores
+            + self._wm * model_scores
+            + self._wn * ngram_scores
+        )
+        w_len = max(0.0, min(float(w_length), 0.99))
+        final = (1.0 - w_len) * base_blend + w_len * length_scores
+
+        order = np.argsort(-final)
+        top_indices = order[:top_k]
+
+        if return_details:
+            return [
+                RankedCandidate(
+                    word=words[i],
+                    word_id=word_ids_list[i],
+                    freq_score=float(freq_scores[i]),
+                    model_score=float(model_scores[i]),
+                    ngram_score=float(ngram_scores[i]),
+                    final_score=float(final[i]),
+                )
+                for i in top_indices
+            ]
+        return [words[i] for i in top_indices]
+
     def predict_with_trace(
         self,
         digit_seq: str,

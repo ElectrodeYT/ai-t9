@@ -18,7 +18,7 @@ from ai_t9.model.vocab import Vocabulary
 from ai_t9.dictionary import T9Dictionary
 from ai_t9.model.dual_encoder import DualEncoder
 from ai_t9.ngram import BigramScorer
-from ai_t9.predictor import T9Predictor, _normalise
+from ai_t9.predictor import T9Predictor, RankedCandidate, _normalise
 from ai_t9.session import T9Session
 
 
@@ -608,6 +608,186 @@ class TestNormalise:
         arr1 = np.array([1.0, 2.0, 3.0, 4.0])
         arr2 = np.array([10.0, 200.0, 3000.0, 40000.0])  # same ordering
         np.testing.assert_allclose(_normalise(arr1), _normalise(arr2))
+
+
+# ===========================================================================
+# Prefix completion tests — T9Dictionary.prefix_lookup
+# ===========================================================================
+
+class TestPrefixLookup:
+    """Tests for prefix-based autocompletion at the dictionary layer."""
+
+    def test_prefix_returns_longer_words(self, tiny_dict: T9Dictionary):
+        # "46" maps exactly to "go"/"in"; prefix should find "4663" words
+        results = tiny_dict.prefix_lookup("46")
+        words = [w for w, _, _ in results]
+        for expected in ("home", "good", "gone", "hood"):
+            assert expected in words
+
+    def test_prefix_excludes_exact_matches(self, tiny_dict: T9Dictionary):
+        results = tiny_dict.prefix_lookup("46")
+        words = [w for w, _, _ in results]
+        # "go" and "in" map to "46" exactly — should not appear
+        assert "go" not in words
+        assert "in" not in words
+
+    def test_prefix_returns_full_digit_seq(self, tiny_dict: T9Dictionary):
+        results = tiny_dict.prefix_lookup("46")
+        for _word, _wid, full_digits in results:
+            assert full_digits.startswith("46")
+            assert len(full_digits) > 2
+
+    def test_prefix_sorted_by_frequency(self, tiny_dict: T9Dictionary):
+        results = tiny_dict.prefix_lookup("46")
+        ids = [wid for _, wid, _ in results]
+        vocab = tiny_dict.vocab
+        log_freqs = [vocab.logfreq(wid) for wid in ids]
+        assert log_freqs == sorted(log_freqs, reverse=True)
+
+    def test_single_digit_prefix(self, tiny_dict: T9Dictionary):
+        # "2" exactly matches "a"; prefix should find "be"(23), "and"(263), "any"(269)
+        results = tiny_dict.prefix_lookup("2")
+        words = [w for w, _, _ in results]
+        assert "a" not in words  # exact match excluded
+        for expected in ("be", "and", "any"):
+            assert expected in words
+
+    def test_max_extra_digits_caps_results(self, tiny_dict: T9Dictionary):
+        # "2" prefix with max_extra_digits=1 → only "be" (23, 1 extra digit)
+        results = tiny_dict.prefix_lookup("2", max_extra_digits=1)
+        words = [w for w, _, _ in results]
+        assert "be" in words
+        assert "and" not in words  # 263 is 2 extra digits
+        assert "any" not in words  # 269 is 2 extra digits
+
+    def test_no_prefix_matches_returns_empty(self, tiny_dict: T9Dictionary):
+        results = tiny_dict.prefix_lookup("99999")
+        assert results == []
+
+    def test_max_candidates_limits_output(self, tiny_dict: T9Dictionary):
+        results = tiny_dict.prefix_lookup("4", max_candidates=2)
+        assert len(results) <= 2
+
+    def test_prefix_after_save_load(
+        self, tiny_dict: T9Dictionary, tiny_vocab: Vocabulary, tmp_path,
+    ):
+        path = tmp_path / "dict.json"
+        tiny_dict.save(path)
+        loaded = T9Dictionary.load(path, tiny_vocab)
+        assert loaded.prefix_lookup("46") == tiny_dict.prefix_lookup("46")
+
+
+# ===========================================================================
+# Prefix completion tests — T9Predictor.predict_completions
+# ===========================================================================
+
+class TestPredictCompletions:
+    """Tests for predict_completions() on the predictor."""
+
+    def test_returns_words(self, tiny_predictor: T9Predictor):
+        results = tiny_predictor.predict_completions("46")
+        assert all(isinstance(w, str) for w in results)
+        assert len(results) >= 1
+
+    def test_completions_are_extensions(self, tiny_predictor: T9Predictor):
+        """Every returned word's digit sequence should extend the prefix."""
+        from ai_t9.t9_map import word_to_digits
+
+        results = tiny_predictor.predict_completions("46")
+        for word in results:
+            digits = word_to_digits(word)
+            assert digits is not None
+            assert digits.startswith("46")
+            assert len(digits) > 2
+
+    def test_excludes_exact_matches(self, tiny_predictor: T9Predictor):
+        results = tiny_predictor.predict_completions("46")
+        assert "go" not in results
+        assert "in" not in results
+
+    def test_top_k_respected(self, tiny_predictor: T9Predictor):
+        results = tiny_predictor.predict_completions("46", top_k=2)
+        assert len(results) <= 2
+
+    def test_return_details(self, tiny_predictor: T9Predictor):
+        results = tiny_predictor.predict_completions("46", return_details=True)
+        assert all(isinstance(r, RankedCandidate) for r in results)
+        finals = [r.final_score for r in results]
+        assert finals == sorted(finals, reverse=True)
+
+    def test_invalid_prefix_raises(self, tiny_predictor: T9Predictor):
+        with pytest.raises(ValueError):
+            tiny_predictor.predict_completions("1234")
+
+    def test_no_completions_returns_empty(self, tiny_predictor: T9Predictor):
+        results = tiny_predictor.predict_completions("99999")
+        assert results == []
+
+    def test_length_weight_prefers_shorter(self, tiny_predictor: T9Predictor):
+        """With high w_length, shorter completions should rank higher."""
+        # "2" prefix: "be"(23, +1 digit), "and"/"any"(263/269, +2 digits)
+        results = tiny_predictor.predict_completions(
+            "2", top_k=5, w_length=0.90,
+        )
+        # "be" is 1 extra digit, should outrank "and"/"any" (2 extra digits)
+        # when length weight is extremely high
+        if "be" in results and "and" in results:
+            assert results.index("be") < results.index("and")
+
+    def test_with_model(
+        self, tiny_dict: T9Dictionary, tiny_encoder: DualEncoder, tiny_vocab: Vocabulary,
+    ):
+        predictor = T9Predictor(tiny_dict, model=tiny_encoder)
+        results = predictor.predict_completions("46", context=["the"])
+        assert len(results) >= 1
+        assert all(w in {"home", "good", "gone", "hood"} for w in results)
+
+
+# ===========================================================================
+# Session completion tests
+# ===========================================================================
+
+class TestSessionCompletions:
+    def test_completions_returns_words(self, tiny_predictor: T9Predictor):
+        session = T9Session(tiny_predictor)
+        results = session.completions("46")
+        assert len(results) >= 1
+
+    def test_completions_use_context(self, tiny_predictor: T9Predictor):
+        session = T9Session(tiny_predictor)
+        session.add_context("the")
+        results = session.completions("46")
+        assert len(results) >= 1
+
+    def test_dial_with_completions(self, tiny_predictor: T9Predictor):
+        session = T9Session(tiny_predictor)
+        exact, comps = session.dial_with_completions("46")
+        # exact matches: "go", "in"
+        assert any(w in exact for w in ("go", "in"))
+        # completions: "home", "good", "gone", "hood"
+        assert len(comps) >= 1
+        comp_words = set(comps)
+        assert comp_words.issubset({"home", "good", "gone", "hood"})
+
+    def test_dial_with_completions_details(self, tiny_predictor: T9Predictor):
+        session = T9Session(tiny_predictor)
+        exact, comps = session.dial_with_completions(
+            "46", return_details=True,
+        )
+        assert all(isinstance(r, RankedCandidate) for r in exact)
+        assert all(isinstance(r, RankedCandidate) for r in comps)
+
+    def test_completions_flow(self, tiny_predictor: T9Predictor):
+        """Simulate a user getting completions while typing."""
+        session = T9Session(tiny_predictor)
+        session.confirm("the")
+
+        # After typing "46", see exact + completions
+        exact, comps = session.dial_with_completions("46")
+        # User accepts a completion
+        if comps:
+            session.confirm(comps[0])
+            assert len(session.context) == 2
 
 
 # ===========================================================================

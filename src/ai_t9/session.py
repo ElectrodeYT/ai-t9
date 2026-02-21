@@ -82,6 +82,71 @@ class T9Session:
             return self._context.pop()
         return None
 
+    def completions(
+        self,
+        digit_prefix: str,
+        top_k: int = 5,
+        max_extra_digits: int = 6,
+        w_length: float = 0.30,
+        return_details: bool = False,
+    ) -> list[str] | list[RankedCandidate]:
+        """Predict word completions for a partially typed digit sequence.
+
+        Like :meth:`dial` but returns words *longer* than the input, offering
+        autocompletion suggestions.  Uses the current context for ranking.
+
+        Args:
+            digit_prefix:     Partial T9 digit sequence, e.g. ``"466"``
+            top_k:            Number of completions to return
+            max_extra_digits: Maximum additional digits beyond the prefix
+            w_length:         Weight for the length bonus (higher → prefer
+                              shorter completions)
+            return_details:   Return RankedCandidate objects with score breakdown
+
+        Returns:
+            List of predicted words (or RankedCandidate if return_details=True)
+        """
+        return self._predictor.predict_completions(
+            digit_prefix,
+            context=list(self._context),
+            top_k=top_k,
+            max_extra_digits=max_extra_digits,
+            w_length=w_length,
+            return_details=return_details,
+        )
+
+    def dial_with_completions(
+        self,
+        digit_seq: str,
+        top_k: int = 5,
+        completion_k: int = 3,
+        max_extra_digits: int = 6,
+        w_length: float = 0.30,
+        return_details: bool = False,
+    ) -> tuple[
+        list[str] | list[RankedCandidate],
+        list[str] | list[RankedCandidate],
+    ]:
+        """Return both exact matches and completions for the given digits.
+
+        Convenience method combining :meth:`dial` and :meth:`completions`
+        in a single call — useful for UIs that show both sections.
+
+        Returns:
+            ``(exact_matches, completions)`` — two separate lists.
+        """
+        exact = self.dial(
+            digit_seq, top_k=top_k, return_details=return_details,
+        )
+        comps = self.completions(
+            digit_seq,
+            top_k=completion_k,
+            max_extra_digits=max_extra_digits,
+            w_length=w_length,
+            return_details=return_details,
+        )
+        return exact, comps
+
     def reset(self) -> None:
         """Clear the context window (start of a new message)."""
         self._context.clear()

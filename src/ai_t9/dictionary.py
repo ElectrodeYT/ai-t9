@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import json
 from pathlib import Path
 
@@ -78,6 +79,7 @@ class T9Dictionary:
         for digits in index:
             index[digits].sort(key=lambda t: vocab.logfreq(t[1]), reverse=True)
         self._index = index
+        self._sorted_keys = sorted(self._index.keys())
 
     # ------------------------------------------------------------------
     # Lookup
@@ -94,6 +96,38 @@ class T9Dictionary:
     def digit_sequences(self) -> list[str]:
         """All digit sequences that have at least one matching word."""
         return list(self._index.keys())
+
+    def prefix_lookup(
+        self,
+        digit_prefix: str,
+        max_extra_digits: int = 6,
+        max_candidates: int = 100,
+    ) -> list[tuple[str, int, str]]:
+        """Return candidates whose digit sequences *extend* the given prefix.
+
+        Each result is a ``(word, word_id, full_digit_seq)`` tuple.
+        Exact matches are **excluded** (use :meth:`lookup` for those).
+
+        Results are sorted by descending log-frequency and capped at
+        *max_candidates*.  Only sequences with at most *max_extra_digits*
+        digits beyond the prefix are considered.
+        """
+        lo = bisect.bisect_left(self._sorted_keys, digit_prefix)
+        results: list[tuple[str, int, str]] = []
+        for i in range(lo, len(self._sorted_keys)):
+            key = self._sorted_keys[i]
+            if not key.startswith(digit_prefix):
+                break
+            if key == digit_prefix:
+                continue  # skip exact matches
+            extra = len(key) - len(digit_prefix)
+            if extra > max_extra_digits:
+                continue
+            for word, wid in self._index[key]:
+                results.append((word, wid, key))
+        # Sort by descending log-frequency.
+        results.sort(key=lambda t: self._vocab.logfreq(t[1]), reverse=True)
+        return results[:max_candidates]
 
     @property
     def vocab(self) -> Vocabulary:
@@ -126,6 +160,7 @@ class T9Dictionary:
             digits: [(entry[0], entry[1]) for entry in entries]
             for digits, entries in raw.items()
         }
+        obj._sorted_keys = sorted(obj._index.keys())
         return obj
 
     @classmethod

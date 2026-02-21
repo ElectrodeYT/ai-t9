@@ -302,6 +302,7 @@ def _corpus_file_sentence_ids(path: Path, vocab: Vocabulary) -> list[list[int]]:
 def _precompute_pairs(
     sentences: list[list[int]],
     context_window: int,
+    verbose: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Pre-compute all (context, target) training pairs as flat NumPy arrays.
 
@@ -320,6 +321,9 @@ def _precompute_pairs(
     n_pairs = sum(max(0, len(s) - 1) for s in sentences)
     ctx_arr = np.zeros((n_pairs, context_window), dtype=np.int64)
     pos_arr = np.empty(n_pairs, dtype=np.int64)
+    if verbose:
+        print("Precomputing training pairs...")
+        progress_interval = max(1, n_pairs // 100)  # update every ~1%
     idx = 0
     for sent in sentences:
         for t in range(1, len(sent)):
@@ -330,6 +334,14 @@ def _precompute_pairs(
             ctx_arr[idx, context_window - len(src):] = src
             pos_arr[idx] = sent[t]
             idx += 1
+            if verbose and idx % progress_interval == 0:
+                frac = idx / n_pairs
+                bar_w = 20
+                filled = int(bar_w * frac)
+                bar = "\u2588" * filled + "\u2591" * (bar_w - filled)
+                print(f"\r  |{bar}| {idx}/{n_pairs} pairs", end="", flush=True)
+    if verbose:
+        print()  # newline after progress bar
     # Truncate to actual count (idx < n_pairs when UNK targets were skipped)
     return ctx_arr[:idx], pos_arr[:idx]
 
@@ -434,14 +446,19 @@ class DualEncoderTrainer:
         torch = _require_torch()
         t0 = time.monotonic()
         sentences: list[list[int]] = []
-        for path in paths:
+        if verbose:
+            print("Loading corpus...")
+        total_sentences = 0
+        for i, path in enumerate(paths):
             path = Path(path)
             file_sents = _corpus_file_sentence_ids(path, self._vocab)
-            if verbose:
-                print(f"  {path.name}: {len(file_sents):,} sentences  "
-                      f"({time.monotonic()-t0:.2f}s)")
+            total_sentences += len(file_sents)
             sentences.extend(file_sents)
+            if verbose:
+                elapsed = time.monotonic() - t0
+                print(f"\r  Loaded {i+1}/{len(paths)} files ({total_sentences:,} sentences)  ({elapsed:.2f}s)", end="", flush=True)
         if verbose:
+            print()  # newline
             print(f"  Total: {len(sentences):,} sentences")
         self._train(sentences, epochs=epochs, torch=torch, verbose=verbose)
 
@@ -539,7 +556,7 @@ class DualEncoderTrainer:
         # shuffling and per-batch slicing happen entirely on-device via
         # torch.randperm + index_select, so the CPU does virtually no work
         # during the training loop — just dispatching CUDA kernels.
-        ctx_np, pos_np = _precompute_pairs(sentences, self._context_window)
+        ctx_np, pos_np = _precompute_pairs(sentences, self._context_window, verbose=verbose)
         n_pairs = len(pos_np)
         n_batches = math.ceil(n_pairs / self._batch_size)
         self._phase(f"pairs pre-computed ({n_pairs:,} pairs)", t_ref)

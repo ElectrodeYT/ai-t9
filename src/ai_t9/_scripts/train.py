@@ -77,7 +77,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--neg-samples",      type=int,   default=20,   help="Negatives per positive, sampled on GPU (default: 20)")
     parser.add_argument("--lr",               type=float, default=0.005,help="Learning rate (default: 0.005)")
     parser.add_argument("--batch-size",       type=int,   default=2048, help="Pairs per batch (default: 2048; try 4096–8192 on large GPUs)")
-    parser.add_argument("--prefetch-batches", type=int,   default=8,    help="Batches to build ahead in background thread (default: 8)")
     parser.add_argument("--seed",             type=int,   default=42,   help="Random seed (default: 42)")
     parser.add_argument(
         "--device",
@@ -114,7 +113,6 @@ def main(argv: list[str] | None = None) -> int:
         neg_samples=args.neg_samples,
         lr=args.lr,
         batch_size=args.batch_size,
-        prefetch_batches=args.prefetch_batches,
         seed=args.seed,
         device=args.device,
         debug=args.debug,

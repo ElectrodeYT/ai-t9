@@ -12,40 +12,44 @@ Training objective: candidate-only negative sampling
 
 GPU utilisation design
 -----------------------
-1. Pre-computed pairs — all (context, target) pairs are materialised as flat
-   NumPy arrays *once* before training.  Each epoch shuffles a lightweight
-   index array in-place (no allocation); batches are gathered via small
-   fancy-index slices (~50 KB each) rather than copying the full dataset.
-   This eliminates GIL contention and the ~500 MB per-epoch copy+pin that
-   previously saturated the CPU.
+1. Pre-computed pairs on device — all (context, target) pairs are
+   materialised as flat NumPy arrays once, then transferred to the compute
+   device (GPU).  Per-epoch shuffling uses torch.randperm on-device, and
+   batches are simple O(1) tensor slices + index_select — the CPU does
+   virtually no work during the training loop.
 
 2. On-GPU negative sampling — torch.randint generates all negative IDs
-   directly on the GPU; only (ctx_ids, pos_ids) are transferred from CPU,
-   roughly 20× less data per batch than before.
+   directly on the GPU; no candidate data crosses the PCIe bus per batch.
 
-3. Pinned memory + non-blocking transfers (CUDA only) — double-buffered
-   pre-allocated pinned tensors avoid per-batch cudaHostAlloc/Free OS calls;
-   batch data is DMA-transferred asynchronously.
+3. Blocking CUDA sync — cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync)
+   is called before context creation so the CPU sleeps on a mutex instead
+   of the default spin-wait, which would otherwise pin a core at 100 %.
 
 4. Automatic mixed precision (AMP) — on CUDA, forward passes run under
    torch.amp.autocast, casting torch.bmm to float16.  GradScaler is
    intentionally omitted because this model produces no float16 gradients
-   (only bmm is autocasted; everything else stays float32), and removing it
-   eliminates a per-batch CPU↔GPU sync caused by its internal .item() call
-   (CUDA defaults to spin-wait synchronisation, which pins a CPU core).
+   (only bmm is autocasted; everything else stays float32).
 
 5. GPU-side loss accumulation — training loss is accumulated in a device
    tensor and only transferred to CPU for progress-bar redraws (~4×/s),
-   avoiding ~1000 per-batch spin-wait sync points per second.
+   avoiding per-batch CPU↔GPU synchronisation.
 
 6. TF32 matmul (Ampere+ GPUs) — float32 matrix multiplications use
    TensorFloat-32 for ~3× speed at effectively no accuracy cost.
+
+7. CUDA Graphs — the entire forward+backward+optimizer step is captured
+   into a single replayable CUDA graph after a short warmup.  On each
+   batch the CPU only performs two index_selects (data gather into static
+   buffers) and one graph.replay() call, reducing per-batch dispatch
+   overhead from ~40 Python→C++ transitions to ~3.
 """
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import math
-import random
+import re
 import time
 from pathlib import Path
 
@@ -91,6 +95,90 @@ def _resolve_device(torch, preference: str) -> "torch.device":
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def _find_cudart() -> ctypes.CDLL | None:
+    """Find the CUDA runtime library that is actually loaded in this process.
+
+    PyTorch pip wheels install cudart via the ``nvidia-cuda-runtime-cuXX``
+    package (e.g. ``nvidia/cuda_runtime/lib/libcudart.so.12``), NOT inside
+    ``torch/lib/``.  The only reliable way to find it is to ensure PyTorch
+    has loaded CUDA (``import torch`` triggers this) and then inspect
+    ``/proc/self/maps`` for the mapped library.
+
+    Search order:
+      1. Import torch (triggers lazy-loading of its CUDA libraries)
+      2. ``/proc/self/maps`` — the authoritative answer on Linux
+      3. ``nvidia.cuda_runtime`` package path (direct lookup)
+      4. ``ctypes.util.find_library`` (system-wide fallback)
+    """
+    # Ensure torch (+ its bundled CUDA libs) are loaded into the process.
+    try:
+        import torch as _torch  # noqa: F811
+    except ImportError:
+        pass
+
+    # 1) Already mapped into the process (most reliable on Linux)
+    try:
+        with open("/proc/self/maps") as f:
+            for line in f:
+                m = re.search(r"(/\S*libcudart\S*\.so\S*)", line)
+                if m:
+                    try:
+                        return ctypes.CDLL(m.group(1))
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+
+    # 2) nvidia-cuda-runtime package (pip install nvidia-cuda-runtime-cu12)
+    try:
+        import nvidia.cuda_runtime  # type: ignore[import-untyped]
+        lib_dir = Path(nvidia.cuda_runtime.__file__).parent / "lib"
+        for candidate in sorted(lib_dir.glob("libcudart*.so*"), reverse=True):
+            try:
+                return ctypes.CDLL(str(candidate))
+            except OSError:
+                continue
+    except Exception:
+        pass
+
+    # 3) System library
+    name = ctypes.util.find_library("cudart")
+    if name:
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            pass
+
+    return None
+
+
+def _set_cuda_blocking_sync() -> bool:
+    """Switch CUDA synchronisation from spin-wait to blocking (mutex).
+
+    By default CUDA uses ``cudaDeviceScheduleSpin`` when the device context
+    count is low, which busy-loops a CPU core at 100 % while waiting for
+    GPU operations.  ``cudaDeviceScheduleBlockingSync`` (flag 0x04) makes
+    the CPU sleep on a mutex instead, freeing the core for useful work.
+
+    Must be called **before** the CUDA primary context is created (i.e.
+    before any ``.to('cuda')``, and ideally before ``torch.cuda.is_available()``
+    since some driver versions create a context there).
+
+    Returns True if the flag was accepted, False otherwise.
+    """
+    cudart = _find_cudart()
+    if cudart is None:
+        return False
+    try:
+        cudart.cudaSetDeviceFlags.argtypes = [ctypes.c_uint]
+        cudart.cudaSetDeviceFlags.restype = ctypes.c_int
+        # cudaDeviceScheduleBlockingSync = 0x04
+        ret = cudart.cudaSetDeviceFlags(0x04)
+        return ret == 0   # cudaSuccess
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +340,6 @@ class DualEncoderTrainer:
         neg_samples: int = 20,
         lr: float = 0.005,
         batch_size: int = 2048,
-        prefetch_batches: int = 8,
         seed: int = 42,
         device: str = "auto",
         debug: bool = False,
@@ -263,13 +350,10 @@ class DualEncoderTrainer:
         self._neg_samples = neg_samples
         self._lr = lr
         self._batch_size = batch_size
-        self._prefetch_batches = prefetch_batches
         self._seed = seed
         self._device_pref = device
         self._debug = debug
-        self._device = None   # resolved when torch is available at train time
         self._model: _TorchDualEncoder | None = None
-        self._torch = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -364,15 +448,23 @@ class DualEncoderTrainer:
     ) -> None:
         t_ref = time.monotonic()
 
+        # Switch CUDA from spin-wait to blocking sync.  This MUST happen
+        # before _resolve_device() because torch.cuda.is_available() may
+        # create the CUDA primary context on some driver versions, after
+        # which cudaSetDeviceFlags returns cudaErrorSetOnActiveProcess.
+        if self._device_pref in ("auto", "cuda"):
+            ok = _set_cuda_blocking_sync()
+            self._phase(
+                f"CUDA blocking sync {'set' if ok else 'FAILED (context may already exist)'}",
+                t_ref,
+            )
+
         # ---- Phase 1: device resolution --------------------------------------
         device = _resolve_device(torch, self._device_pref)
-        self._device = device
-        self._torch = torch
+        is_cuda = str(device).startswith("cuda")
         self._phase("device resolved", t_ref)
 
         torch.manual_seed(self._seed)
-        random.seed(self._seed)
-        np_rng = np.random.default_rng(self._seed)
 
         # ---- Phase 2: model creation + .to(device) --------------------------
         # NOTE: On CUDA the first .to(device) call triggers driver initialisation
@@ -385,62 +477,121 @@ class DualEncoderTrainer:
         self._phase(f"model created and moved to {device}", t_ref)
 
         # ---- Phase 3: optimizer + loss fn -----------------------------------
-        optimizer = torch.optim.Adam(model.parameters(), lr=self._lr)
+        # capturable=True lets Adam.step() be recorded inside a CUDA graph.
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=self._lr, capturable=is_cuda)
         bce = torch.nn.BCEWithLogitsLoss()
         self._phase("optimizer ready", t_ref)
 
-        # ---- Phase 4: pre-compute all training pairs as flat arrays ----------
-        # Done once; per-epoch shuffling uses a lightweight index permutation
-        # and pairs are gathered per-batch (only ~50 KB each), avoiding the
-        # ~500 MB full-array copy + pin that previously pinned the CPU at 100%.
-        ctx_all, pos_all = _precompute_pairs(sentences, self._context_window)
-        n_pairs = len(pos_all)
+        # ---- Phase 4: pre-compute pairs + move to device ---------------------
+        # All training data lives on the compute device (GPU).  Per-epoch
+        # shuffling and per-batch slicing happen entirely on-device via
+        # torch.randperm + index_select, so the CPU does virtually no work
+        # during the training loop — just dispatching CUDA kernels.
+        ctx_np, pos_np = _precompute_pairs(sentences, self._context_window)
+        n_pairs = len(pos_np)
         n_batches = math.ceil(n_pairs / self._batch_size)
         self._phase(f"pairs pre-computed ({n_pairs:,} pairs)", t_ref)
 
+        ctx_dev = torch.from_numpy(ctx_np).to(device)
+        pos_dev = torch.from_numpy(pos_np).to(device)
+        del ctx_np, pos_np          # free CPU copies
+        self._phase("training data moved to device", t_ref)
+
         # AMP autocast (CUDA only).  Under autocast only torch.bmm is cast to
-        # float16; everything else (embedding lookup, normalize, element-wise
-        # ops, BCE loss) stays float32.  Because no float16 gradients are
-        # produced, GradScaler is unnecessary — and removing it eliminates the
-        # per-batch CPU↔GPU sync from its internal found_inf.item() call
-        # (CUDA uses spin-wait synchronisation by default, which pins a CPU
-        # core at 100 % for every sync point).
-        is_cuda = str(device).startswith("cuda")
+        # float16; everything else stays float32.  GradScaler is omitted
+        # because no float16 gradients are produced.
         use_amp = is_cuda
 
-        # TF32 matmul on Ampere+ GPUs (~3× faster float32 ops, negligible
-        # accuracy difference for embedding training).
+        # TF32 matmul on Ampere+ GPUs.
         if is_cuda and hasattr(torch, "set_float32_matmul_precision"):
             torch.set_float32_matmul_precision("high")
 
-        # Pre-allocate double-buffered pinned transfer buffers (CUDA only).
-        # Avoids ~2×n_batches cudaHostAlloc/Free OS calls per epoch.
-        # Double-buffering ensures the DMA from buffer A is finished before
-        # we overwrite it (an entire forward+backward pass intervenes).
-        if is_cuda:
-            _pin_ctx = tuple(
-                torch.empty(self._batch_size, self._context_window,
-                            dtype=torch.int64).pin_memory()
-                for _ in range(2)
-            )
-            _pin_pos = tuple(
-                torch.empty(self._batch_size, dtype=torch.int64).pin_memory()
-                for _ in range(2)
-            )
+        # ---- Phase 5: CUDA Graph setup (optional) ----------------------------
+        # Each batch iteration dispatches ~40 individual CUDA kernels through
+        # Python → PyTorch dispatcher → CUDA driver.  At ~300 batches/sec
+        # that's ~12 000 dispatch calls/sec — the CPU cost of those Python→C++
+        # transitions is the dominant source of the remaining ~90 % CPU usage.
+        #
+        # CUDA Graphs capture the entire forward+backward+optimizer step into
+        # a single replayable GPU-side graph.  On each batch the CPU work is
+        # reduced to 2 index_selects (data gather) + 1 graph.replay(), cutting
+        # per-batch dispatch overhead by roughly an order of magnitude.
+        use_graph = is_cuda and n_pairs >= self._batch_size
+        graph = None
+        static_ctx = None
+        static_pos = None
+        static_loss = None
+
+        if use_graph:
+            batch_sz = self._batch_size
+            static_ctx = torch.zeros(
+                batch_sz, self._context_window, dtype=torch.int64, device=device)
+            static_pos = torch.zeros(
+                batch_sz, dtype=torch.int64, device=device)
+
+            # Warmup — CUDA graphs require several eager runs on the same
+            # static tensors to let PyTorch's caching allocator settle.
+            # Uses a side stream; graph capture below happens on the SAME
+            # stream so AccumulateGrad nodes match.
+            graph_stream = torch.cuda.Stream()
+            graph_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(graph_stream):
+                for _ in range(3):
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                        logits, labels = model.score_with_negatives(
+                            static_ctx, static_pos, torch)
+                        loss = bce(logits, labels)
+                    loss.backward()
+                    optimizer.step()
+            torch.cuda.current_stream().wait_stream(graph_stream)
+            # Delete autograd references so stale AccumulateGrad nodes don't
+            # interfere with graph capture.
+            del logits, labels, loss
+            self._phase("CUDA graph warmup done", t_ref)
+
+            # Capture the full training step into a graph on the SAME side
+            # stream used for warmup, so all AccumulateGrad nodes match.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.stream(graph_stream):
+                optimizer.zero_grad(set_to_none=True)
+                with torch.cuda.graph(graph):
+                    with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                        s_logits, s_labels = model.score_with_negatives(
+                            static_ctx, static_pos, torch)
+                        static_loss = bce(s_logits, s_labels)
+                    static_loss.backward()
+                    optimizer.step()
+            torch.cuda.current_stream().wait_stream(graph_stream)
+            self._phase("CUDA graph captured", t_ref)
+
+            # Reset model weights and optimizer moments so the warmup's
+            # garbage updates don't affect real training.  We must keep the
+            # SAME tensor objects (addresses) because the graph references them.
+            with torch.no_grad():
+                torch.nn.init.xavier_uniform_(model.ctx_embed.weight)
+                torch.nn.init.xavier_uniform_(model.wrd_embed.weight)
+            for state in optimizer.state.values():
+                for v in state.values():
+                    if isinstance(v, torch.Tensor) and v.is_floating_point():
+                        v.zero_()
+                    elif isinstance(v, torch.Tensor):  # step counter
+                        v.zero_()
+            self._phase("model + optimizer reset after warmup", t_ref)
 
         if verbose:
+            vram_mb = (ctx_dev.nbytes + pos_dev.nbytes) / 1e6
             print(
                 f"Device: {device}  |  training pairs: {n_pairs:,}  |  "
                 f"vocab: {vocab_size}  |  embed_dim: {self._embed_dim}  |  "
                 f"neg_samples: {self._neg_samples} (on GPU)  |  "
-                f"batch: {self._batch_size}  |  AMP: {'on' if use_amp else 'off'}"
+                f"batch: {self._batch_size}  |  AMP: {'on' if use_amp else 'off'}  |  "
+                f"CUDA graph: {'on' if graph else 'off'}  |  "
+                f"data VRAM: {vram_mb:.0f} MB"
             )
 
-        # Reusable index array — shuffled in-place each epoch (no allocation).
-        perm = np.arange(n_pairs, dtype=np.int64)
-
-        # GPU-side loss accumulator — avoids per-batch CPU↔GPU sync from
-        # .item().  Only synced to CPU for progress-bar redraws (~4×/s).
+        # GPU-side loss accumulator.
         loss_accum = torch.zeros((), device=device)
 
         # ---- Training epochs ------------------------------------------------
@@ -454,37 +605,20 @@ class DualEncoderTrainer:
             t_epoch = time.monotonic()
             loss_accum.zero_()
 
-            # In-place shuffle of index array — O(n) with no allocation,
-            # and NumPy releases the GIL during the shuffle.
-            np_rng.shuffle(perm)
+            # On-device shuffle via randperm — no CPU work at all.
+            perm = torch.randperm(n_pairs, device=device)
             self._phase(f"epoch {epoch} shuffle done", t_ref)
 
             for b in range(n_batches):
                 start = b * self._batch_size
                 end = min(start + self._batch_size, n_pairs)
-                idx = perm[start:end]               # O(1) view into perm
+                idx = perm[start:end]
                 batch_len = end - start
 
-                # Copy into pre-pinned double-buffer, then async-DMA to GPU.
-                # No per-batch cudaHostAlloc, no per-batch .item() sync.
-                if is_cuda:
-                    buf_i = b & 1
-                    _pin_ctx[buf_i][:batch_len].copy_(
-                        torch.from_numpy(ctx_all[idx]))
-                    _pin_pos[buf_i][:batch_len].copy_(
-                        torch.from_numpy(pos_all[idx]))
-                    ctx_t = _pin_ctx[buf_i][:batch_len].to(
-                        device, non_blocking=True)
-                    pos_t = _pin_pos[buf_i][:batch_len].to(
-                        device, non_blocking=True)
-                else:
-                    ctx_t = torch.from_numpy(
-                        np.ascontiguousarray(ctx_all[idx])).to(device)
-                    pos_t = torch.from_numpy(
-                        np.ascontiguousarray(pos_all[idx])).to(device)
-
-                # ---- debug: time first batch in detail ----------------------
+                # ---- debug: time first batch in detail (always eager) -------
                 if self._debug and b == 0 and epoch == 1:
+                    ctx_t = ctx_dev[idx]
+                    pos_t = pos_dev[idx]
                     self._phase(f"  first batch on device ({batch_len} pairs)", t_ref)
                     optimizer.zero_grad(set_to_none=True)
                     with torch.amp.autocast(device_type="cuda", enabled=use_amp):
@@ -500,14 +634,25 @@ class DualEncoderTrainer:
                     continue
                 # -------------------------------------------------------------
 
-                optimizer.zero_grad(set_to_none=True)
-                with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-                    logits, labels = model.score_with_negatives(ctx_t, pos_t, torch)
-                    loss = bce(logits, labels)
-                loss.backward()
-                optimizer.step()
+                if graph is not None and batch_len == self._batch_size:
+                    # Graph path: gather into static buffers, replay graph.
+                    # Only 3 CUDA API calls instead of ~40.
+                    torch.index_select(ctx_dev, 0, idx, out=static_ctx)
+                    torch.index_select(pos_dev, 0, idx, out=static_pos)
+                    graph.replay()
+                    loss_accum += static_loss.detach()
+                else:
+                    # Eager fallback (last partial batch, non-CUDA, no graph).
+                    ctx_t = ctx_dev[idx]
+                    pos_t = pos_dev[idx]
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                        logits, labels = model.score_with_negatives(ctx_t, pos_t, torch)
+                        loss = bce(logits, labels)
+                    loss.backward()
+                    optimizer.step()
+                    loss_accum += loss.detach()
 
-                loss_accum += loss.detach()
                 train_batches_done += 1
 
                 # ---- inline progress bar ------------------------------------
@@ -548,7 +693,6 @@ class DualEncoderTrainer:
                 total_loss = loss_accum.item()
                 avg_loss = total_loss / max(n_batches, 1)
                 pairs_per_sec = n_pairs / elapsed if elapsed > 0 else 0
-                # Overwrite the progress bar with the final epoch summary.
                 print(
                     f"\r  Epoch {epoch}/{epochs}  loss={avg_loss:.4f}  "
                     f"time={elapsed:.1f}s  ({pairs_per_sec:,.0f} pairs/s)"

@@ -14,6 +14,7 @@ Weights are stored as a .npz file — two float32 arrays, typically ~6 MB for
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Sequence
 
@@ -155,6 +156,3 @@ class DualEncoder:
         ctx = rng.normal(0, scale, (vocab.size, embed_dim)).astype(np.float32)
         wrd = rng.normal(0, scale, (vocab.size, embed_dim)).astype(np.float32)
         return cls(ctx, wrd, vocab)
-
-
-import math  # noqa: E402  (placed after class to avoid circular-import noise)

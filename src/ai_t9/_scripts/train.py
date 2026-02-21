@@ -14,6 +14,14 @@ Usage::
 
     # Also export a bigram model for the ngram signal
     ai-t9-train --vocab data/vocab.json --output data/model.npz --save-ngram data/bigram.json
+
+    # Precompute pairs once (CPU job) and save for later GPU training runs:
+    ai-t9-train --vocab data/vocab.json --corpus corpuses/ \\
+                --save-pairs data/pairs.npz --pairs-only
+
+    # GPU training job that reuses saved pairs (no corpus loading):
+    ai-t9-train --vocab data/vocab.json --load-pairs data/pairs.npz \\
+                --output data/model.npz --epochs 10
 """
 
 from __future__ import annotations
@@ -79,6 +87,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--batch-size",       type=int,   default=2048, help="Pairs per batch (default: 2048; try 4096–8192 on large GPUs)")
     parser.add_argument("--seed",             type=int,   default=42,   help="Random seed (default: 42)")
     parser.add_argument(
+        "--save-pairs",
+        metavar="FILE",
+        default=None,
+        help="After loading the corpus, precompute training pairs and save them "
+             "to this .npz file.  Use with --pairs-only to skip training entirely.",
+    )
+    parser.add_argument(
+        "--load-pairs",
+        metavar="FILE",
+        default=None,
+        help="Load precomputed pairs from this .npz file instead of reading a corpus. "
+             "Skips all corpus I/O and pair computation — ideal for GPU cloud jobs.",
+    )
+    parser.add_argument(
+        "--pairs-only",
+        action="store_true",
+        help="Only precompute and save pairs (requires --save-pairs); exit without training.",
+    )
+    parser.add_argument(
         "--device",
         default="auto",
         choices=["auto", "cuda", "mps", "cpu"],
@@ -93,6 +120,17 @@ def main(argv: list[str] | None = None) -> int:
 
     from ai_t9.model.vocab import Vocabulary
     from ai_t9.model.trainer import DualEncoderTrainer
+
+    # ---- Validate flag combinations ------------------------------------
+    if args.pairs_only and not args.save_pairs:
+        print("ERROR: --pairs-only requires --save-pairs", file=sys.stderr)
+        return 1
+    if args.load_pairs and args.corpus:
+        print("ERROR: --load-pairs and --corpus are mutually exclusive", file=sys.stderr)
+        return 1
+    if args.load_pairs and args.pairs_only:
+        print("ERROR: --load-pairs and --pairs-only are mutually exclusive", file=sys.stderr)
+        return 1
 
     # ---- Load vocabulary -------------------------------------------------
     vocab_path = Path(args.vocab)
@@ -118,13 +156,51 @@ def main(argv: list[str] | None = None) -> int:
         debug=args.debug,
     )
 
-    if args.corpus:
-        corpus_files = _resolve_corpus_files(Path(args.corpus))
-        if corpus_files is None:
+    if args.load_pairs:
+        # Fast path: skip corpus loading, use precomputed pairs directly.
+        pairs_path = Path(args.load_pairs)
+        if not pairs_path.exists():
+            print(f"ERROR: pairs file not found: {pairs_path}", file=sys.stderr)
             return 1
-        trainer.train_from_files(corpus_files, epochs=args.epochs, verbose=True)
+        trainer.train_from_pairs_file(pairs_path, epochs=args.epochs, verbose=True)
     else:
-        trainer.train_from_nltk(epochs=args.epochs, verbose=True)
+        # Load corpus, optionally save pairs, optionally train.
+        if args.corpus:
+            corpus_files = _resolve_corpus_files(Path(args.corpus))
+            if corpus_files is None:
+                return 1
+
+        if args.save_pairs:
+            from ai_t9.model.trainer import (
+                _corpus_file_sentence_ids,
+                _brown_sentence_ids,
+                save_pairs,
+            )
+            print("Loading corpus for pair precomputation…")
+            if args.corpus:
+                sentences: list[list[int]] = []
+                for p in corpus_files:
+                    sentences.extend(_corpus_file_sentence_ids(p, vocab))
+            else:
+                sentences = _brown_sentence_ids(vocab)
+            pairs_out = Path(args.save_pairs)
+            n = save_pairs(
+                sentences,
+                context_window=args.context_window,
+                vocab_size=vocab.size,
+                path=pairs_out,
+                verbose=True,
+            )
+            print(f"Precomputed {n:,} pairs → {pairs_out}")
+            if args.pairs_only:
+                return 0
+            # Train from the just-written file (validates the roundtrip too).
+            resolved = pairs_out if str(pairs_out).endswith(".npz") else Path(str(pairs_out) + ".npz")
+            trainer.train_from_pairs_file(resolved, epochs=args.epochs, verbose=True)
+        elif args.corpus:
+            trainer.train_from_files(corpus_files, epochs=args.epochs, verbose=True)
+        else:
+            trainer.train_from_nltk(epochs=args.epochs, verbose=True)
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -120,14 +120,26 @@ class DualEncoder:
     # ------------------------------------------------------------------
 
     def save(self, path: str | Path) -> None:
-        """Save embeddings to a .npz file."""
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        """Save embeddings to a .npz file.
+
+        Writes via an in-memory buffer so the output is always a single
+        sequential write, compatible with S3 CloudBucketMounts (Mountpoint
+        does not support the random seeks that np.savez makes when given
+        a file-path directly).
+        """
+        import io
+        import shutil
+        buf = io.BytesIO()
         np.savez_compressed(
-            str(path),
+            buf,
             context_embeds=self._ctx,
             word_embeds=self._wrd,
         )
+        buf.seek(0)
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            shutil.copyfileobj(buf, f)
 
     @classmethod
     def load(cls, path: str | Path, vocab: Vocabulary) -> "DualEncoder":

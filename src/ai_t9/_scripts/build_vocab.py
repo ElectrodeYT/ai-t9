@@ -136,6 +136,20 @@ def main(argv: list[str] | None = None) -> int:
         wordlist = load_wordlist(dict_file)
         print(f"Loaded wordlist: {len(wordlist):,} verified words from {dict_file.name}")
 
+        # Merge wordlist words into the vocabulary so they get real IDs
+        # (not UNK) and can receive meaningful frequency/embedding scores.
+        # Words already in the vocab keep their counts; new words get a
+        # floor count of 1.
+        old_size = vocab.size
+        vocab = vocab.merge_wordlist(wordlist)
+        if vocab.size > old_size:
+            added = vocab.size - old_size
+            print(f"  Merged {added:,} wordlist-only words into vocabulary "
+                  f"(new size: {vocab.size})")
+            # Re-save the merged vocabulary.
+            vocab.save(vocab_path)
+            print(f"  Updated {vocab_path}")
+
     # ---- Build T9 dictionary index ----------------------------------------
     dictionary = T9Dictionary.build(vocab, wordlist=wordlist, verbose=True)
     dict_path = out_dir / "dict.json"

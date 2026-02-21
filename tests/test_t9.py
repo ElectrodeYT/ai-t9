@@ -186,6 +186,35 @@ class TestVocabulary:
         assert "cat" in vocab
         assert "dog" not in vocab  # cut off at max_words=3
 
+    def test_merge_wordlist_adds_new_words(self, tiny_vocab: Vocabulary):
+        wordlist = {"xylophone", "aardvark", "home"}  # home already in vocab
+        merged = tiny_vocab.merge_wordlist(wordlist)
+        # home was already present — should not be duplicated
+        assert merged.word_to_id("home") == tiny_vocab.word_to_id("home")
+        # xylophone and aardvark are new
+        assert "xylophone" in merged
+        assert "aardvark" in merged
+        assert merged.word_to_id("xylophone") != merged.UNK_ID
+        assert merged.word_to_id("aardvark") != merged.UNK_ID
+        assert merged.size == tiny_vocab.size + 2
+
+    def test_merge_wordlist_floor_frequency(self, tiny_vocab: Vocabulary):
+        merged = tiny_vocab.merge_wordlist({"xylophone"})
+        xyl_lf = merged.logfreq(merged.word_to_id("xylophone"))
+        unk_lf = merged.logfreq(merged.UNK_ID)
+        home_lf = merged.logfreq(merged.word_to_id("home"))
+        # New word should have log-freq above UNK but below frequent words
+        assert xyl_lf > unk_lf
+        assert xyl_lf < home_lf
+
+    def test_merge_wordlist_empty_returns_self(self, tiny_vocab: Vocabulary):
+        merged = tiny_vocab.merge_wordlist(set())
+        assert merged is tiny_vocab
+
+    def test_merge_wordlist_all_existing_returns_self(self, tiny_vocab: Vocabulary):
+        merged = tiny_vocab.merge_wordlist({"home", "good"})
+        assert merged is tiny_vocab  # all words already present
+
 
 # ===========================================================================
 # T9Dictionary tests

@@ -5,9 +5,12 @@ Usage::
     # Train on NLTK Brown corpus (default)
     ai-t9-train --vocab data/vocab.json --output data/model.npz
 
-    # Train on your own corpus
+    # Train on a single corpus file
     ai-t9-train --vocab data/vocab.json --corpus mytext.txt --output data/model.npz \\
                 --epochs 5 --embed-dim 64 --neg-samples 20
+
+    # Train on a folder of corpus files (all *.txt files are combined)
+    ai-t9-train --vocab data/vocab.json --corpus corpuses/ --output data/model.npz
 
     # Also export a bigram model for the ngram signal
     ai-t9-train --vocab data/vocab.json --output data/model.npz --save-ngram data/bigram.json
@@ -18,6 +21,24 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+
+
+def _resolve_corpus_files(corpus_path: Path) -> list[Path] | None:
+    """Return sorted list of *.txt files from a file or directory path.
+
+    Prints an error and returns None if the path doesn't exist or a directory
+    contains no .txt files (so callers can return 1 immediately).
+    """
+    if corpus_path.is_dir():
+        files = sorted(corpus_path.glob("*.txt"))
+        if not files:
+            print(f"ERROR: no *.txt files found in {corpus_path}", file=sys.stderr)
+            return None
+        return files
+    if corpus_path.is_file():
+        return [corpus_path]
+    print(f"ERROR: corpus path not found: {corpus_path}", file=sys.stderr)
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -32,9 +53,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--corpus",
-        metavar="FILE",
+        metavar="FILE_OR_DIR",
         default=None,
-        help="Plain-text corpus file. Defaults to NLTK Brown corpus.",
+        help="Plain-text corpus file, or a directory of *.txt files whose "
+             "sentences are combined. Defaults to NLTK Brown corpus.",
     )
     parser.add_argument(
         "--output",
@@ -49,13 +71,25 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="If given, also save a trained bigram model to this path.",
     )
-    parser.add_argument("--epochs",      type=int,   default=3,    help="Training epochs (default: 3)")
-    parser.add_argument("--embed-dim",   type=int,   default=64,   help="Embedding dimension (default: 64)")
-    parser.add_argument("--context-window", type=int, default=3,   help="Context words to use (default: 3)")
-    parser.add_argument("--neg-samples", type=int,   default=20,   help="Negatives per positive (default: 20)")
-    parser.add_argument("--lr",          type=float, default=0.005,help="Learning rate (default: 0.005)")
-    parser.add_argument("--batch-size",  type=int,   default=512,  help="Batch size (default: 512)")
-    parser.add_argument("--seed",        type=int,   default=42,   help="Random seed (default: 42)")
+    parser.add_argument("--epochs",           type=int,   default=3,    help="Training epochs (default: 3)")
+    parser.add_argument("--embed-dim",        type=int,   default=64,   help="Embedding dimension (default: 64)")
+    parser.add_argument("--context-window",   type=int,   default=3,    help="Context words to use (default: 3)")
+    parser.add_argument("--neg-samples",      type=int,   default=20,   help="Negatives per positive, sampled on GPU (default: 20)")
+    parser.add_argument("--lr",               type=float, default=0.005,help="Learning rate (default: 0.005)")
+    parser.add_argument("--batch-size",       type=int,   default=2048, help="Pairs per batch (default: 2048; try 4096–8192 on large GPUs)")
+    parser.add_argument("--prefetch-batches", type=int,   default=8,    help="Batches to build ahead in background thread (default: 8)")
+    parser.add_argument("--seed",             type=int,   default=42,   help="Random seed (default: 42)")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cuda", "mps", "cpu"],
+        help="Compute device (default: auto — picks CUDA > MPS > CPU)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print timestamped phase breakdown to diagnose startup bottlenecks",
+    )
     args = parser.parse_args(argv)
 
     from ai_t9.model.vocab import Vocabulary
@@ -80,11 +114,17 @@ def main(argv: list[str] | None = None) -> int:
         neg_samples=args.neg_samples,
         lr=args.lr,
         batch_size=args.batch_size,
+        prefetch_batches=args.prefetch_batches,
         seed=args.seed,
+        device=args.device,
+        debug=args.debug,
     )
 
     if args.corpus:
-        trainer.train_from_file(args.corpus, epochs=args.epochs, verbose=True)
+        corpus_files = _resolve_corpus_files(Path(args.corpus))
+        if corpus_files is None:
+            return 1
+        trainer.train_from_files(corpus_files, epochs=args.epochs, verbose=True)
     else:
         trainer.train_from_nltk(epochs=args.epochs, verbose=True)
 
@@ -95,14 +135,14 @@ def main(argv: list[str] | None = None) -> int:
     # ---- Optionally train bigram model -----------------------------------
     if args.save_ngram:
         from ai_t9.ngram import BigramScorer
+        from ai_t9.model.trainer import _corpus_file_sentence_ids
         print("Training bigram model…")
         if args.corpus:
-            # Re-read sentences for bigram training
-            from ai_t9.model.trainer import _corpus_file_sentence_ids
-            sentences = _corpus_file_sentence_ids(Path(args.corpus), vocab)
             scorer = BigramScorer(vocab)
-            for sent in sentences:
-                scorer.train_on_ids(sent)
+            for path in corpus_files:
+                sents = _corpus_file_sentence_ids(path, vocab)
+                for sent in sents:
+                    scorer.train_on_ids(sent)
         else:
             scorer = BigramScorer.build_from_nltk(vocab, verbose=True)
         ngram_path = Path(args.save_ngram)

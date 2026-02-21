@@ -8,6 +8,13 @@ __pycache__/
 # TT9 test stuff localy
 tt9-dictionary
 
+# Output / Corpus data
+data/
+*.db
+*.csv
+*.sqlite
+corpuses/
+
 # Various . folders
 .venv
 .pytest_cache

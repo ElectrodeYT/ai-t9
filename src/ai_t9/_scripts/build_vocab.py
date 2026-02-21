@@ -5,15 +5,46 @@ Usage::
     # From NLTK Brown corpus (default)
     ai-t9-build-vocab --output data/
 
-    # From your own corpus file
-    ai-t9-build-vocab --corpus mytext.txt --output data/ --max-words 30000
+    # From a single corpus file
+    ai-t9-build-vocab --corpus corpuses/mytext.txt --output data/
+
+    # From a folder of corpus files (all *.txt files are combined)
+    ai-t9-build-vocab --corpus corpuses/ --output data/
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from pathlib import Path
+
+
+def _count_words_from_file(path: Path, counter: Counter, verbose: bool) -> int:
+    """Accumulate word counts from a single text file into counter.
+
+    Returns the number of lines processed.
+    """
+    lines = 0
+    with path.open(encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            for word in line.strip().lower().split():
+                if word.isalpha():
+                    counter[word] += 1
+            lines += 1
+    return lines
+
+
+def _resolve_corpus_files(corpus_path: Path) -> list[Path]:
+    """Return a list of text files to read from a file or directory path."""
+    if corpus_path.is_dir():
+        files = sorted(corpus_path.glob("*.txt"))
+        if not files:
+            raise FileNotFoundError(f"No *.txt files found in {corpus_path}")
+        return files
+    if corpus_path.is_file():
+        return [corpus_path]
+    raise FileNotFoundError(f"Corpus path not found: {corpus_path}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -22,10 +53,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--corpus",
-        metavar="FILE",
+        metavar="FILE_OR_DIR",
         default=None,
-        help="Plain-text corpus file (one sentence per line). "
-             "Defaults to NLTK Brown corpus.",
+        help="Plain-text corpus file, or a directory of *.txt files whose "
+             "word counts are combined. Defaults to NLTK Brown corpus.",
     )
     parser.add_argument(
         "--output",
@@ -50,7 +81,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    from collections import Counter
     from ai_t9.model.vocab import Vocabulary
     from ai_t9.dictionary import T9Dictionary
 
@@ -60,16 +90,17 @@ def main(argv: list[str] | None = None) -> int:
     # ---- Build vocabulary -------------------------------------------------
     if args.corpus:
         corpus_path = Path(args.corpus)
-        if not corpus_path.exists():
-            print(f"ERROR: corpus file not found: {corpus_path}", file=sys.stderr)
+        try:
+            files = _resolve_corpus_files(corpus_path)
+        except FileNotFoundError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
             return 1
-        print(f"Reading corpus from {corpus_path}…")
+
         counter: Counter = Counter()
-        with corpus_path.open(encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                for word in line.strip().lower().split():
-                    if word.isalpha():
-                        counter[word] += 1
+        for path in files:
+            lines = _count_words_from_file(path, counter, verbose=True)
+            print(f"  {path.name}: {lines:,} lines  ({sum(counter.values()):,} words so far)")
+
         vocab = Vocabulary.build_from_counts(
             counter, max_words=args.max_words, min_count=args.min_count
         )

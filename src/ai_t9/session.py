@@ -71,6 +71,17 @@ class T9Session:
         for w in words:
             self._context.append(w.lower())
 
+    def undo_confirm(self) -> str | None:
+        """Remove and return the last confirmed word from the context window.
+
+        Useful for backspace-over-confirmed-word behaviour in a GUI: call this
+        to unwind the most recent ``confirm()`` call, then re-display the
+        previous context state.
+        """
+        if self._context:
+            return self._context.pop()
+        return None
+
     def reset(self) -> None:
         """Clear the context window (start of a new message)."""
         self._context.clear()

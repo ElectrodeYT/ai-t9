@@ -33,6 +33,7 @@
   - `pip install -e ".[train]"`
   - `ai-t9-train --vocab data/vocab.json --output data/model.npz --save-ngram data/bigram.json`
 - Manual sanity run: `python examples/demo.py --vocab data/vocab.json --dict data/dict.json --model data/model.npz --ngram data/bigram.json`.
+- Always run tests and sanity checks after making changes, especially to core logic or data processing.
 
 ## Repo-specific patterns
 - Keep inference modules free of torch imports; import torch lazily via `_require_torch()` in training code.

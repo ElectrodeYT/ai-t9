@@ -431,6 +431,49 @@ class TestT9Session:
         r3 = session.dial("4663")  # "home", "good", "gone", "hood"
         assert "home" in r3 or len(r3) > 0  # something is returned
 
+    def test_undo_confirm_returns_last_word(self, tiny_predictor: T9Predictor):
+        session = T9Session(tiny_predictor)
+        session.confirm("hello")
+        session.confirm("world")
+        popped = session.undo_confirm()
+        assert popped == "world"
+        assert session.context == ["hello"]
+
+    def test_undo_confirm_on_empty_returns_none(self, tiny_predictor: T9Predictor):
+        session = T9Session(tiny_predictor)
+        assert session.undo_confirm() is None
+        assert session.context == []
+
+    def test_undo_confirm_all_restores_empty(self, tiny_predictor: T9Predictor):
+        session = T9Session(tiny_predictor)
+        session.confirm("a")
+        session.confirm("b")
+        session.undo_confirm()
+        session.undo_confirm()
+        assert session.context == []
+        assert session.undo_confirm() is None
+
+    def test_undo_confirm_respects_window_boundary(self, tiny_predictor: T9Predictor):
+        """Words evicted from the window can't be un-confirmed."""
+        session = T9Session(tiny_predictor, context_window=2)
+        for w in ["a", "b", "c", "d"]:
+            session.confirm(w)         # window: [c, d]
+        session.undo_confirm()         # pops d  → [c]
+        session.undo_confirm()         # pops c  → []
+        assert session.context == []
+        # 'a' and 'b' were evicted and are irrecoverable
+        assert session.undo_confirm() is None
+
+    def test_undo_confirm_lowers_count(self, tiny_predictor: T9Predictor):
+        session = T9Session(tiny_predictor)
+        for w in ["the", "quick", "brown"]:
+            session.confirm(w)
+        assert len(session.context) == 3
+        session.undo_confirm()
+        assert len(session.context) == 2
+        session.undo_confirm()
+        assert len(session.context) == 1
+
 
 # ===========================================================================
 # Normalise helper
@@ -447,3 +490,284 @@ class TestNormalise:
         arr = np.array([5.0, 5.0, 5.0])
         out = _normalise(arr)
         np.testing.assert_array_equal(out, 0)
+
+
+# ===========================================================================
+# GUI (T9PhoneWindow) tests
+# ===========================================================================
+
+# Skip the entire class if PyQt6 is not installed.
+PyQt6 = pytest.importorskip("PyQt6", reason="PyQt6 not installed — skipping GUI tests")
+
+
+@pytest.fixture(scope="session")
+def qt_app():
+    """Single QApplication reused across all GUI tests."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    yield app
+
+
+@pytest.fixture
+def gui_window(qt_app, tiny_predictor: T9Predictor):
+    """A fresh T9PhoneWindow for each test."""
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent / "examples"))
+    from gui_demo import T9PhoneWindow
+    win = T9PhoneWindow(tiny_predictor, top_k=5)
+    yield win
+    win.close()
+
+
+class TestT9PhoneGUI:
+    # ── Construction ──────────────────────────────────────────────────────────
+
+    def test_window_title(self, gui_window):
+        assert "t9" in gui_window.windowTitle().lower()
+
+    def test_initial_state_empty(self, gui_window):
+        assert gui_window._digit_buf == ""
+        assert gui_window._committed == ""
+        assert gui_window._candidates == []
+        assert gui_window._cand_idx == 0
+
+    def test_initial_mode_is_t9(self, gui_window):
+        assert gui_window._mode == gui_window._MODE_T9
+
+    # ── T9 digit input ────────────────────────────────────────────────────────
+
+    def test_digit_appends_to_buffer(self, gui_window):
+        gui_window._on_key("4")
+        assert gui_window._digit_buf == "4"
+        gui_window._on_key("6")
+        assert gui_window._digit_buf == "46"
+
+    def test_digit_sequence_produces_candidates(self, gui_window):
+        for d in "4663":
+            gui_window._on_key(d)
+        assert len(gui_window._candidates) > 0
+        words = [c.word for c in gui_window._candidates]
+        assert any(w in words for w in ("home", "good", "gone", "hood"))
+
+    def test_candidates_sorted_by_final_score(self, gui_window):
+        for d in "4663":
+            gui_window._on_key(d)
+        finals = [c.final_score for c in gui_window._candidates]
+        assert finals == sorted(finals, reverse=True)
+
+    def test_top_k_respected(self, gui_window):
+        gui_window._top_k = 3
+        for d in "4663":
+            gui_window._on_key(d)
+        assert len(gui_window._candidates) <= 3
+
+    # ── Candidate cycling ─────────────────────────────────────────────────────
+
+    def test_hash_key_cycles_candidates(self, gui_window):
+        for d in "4663":
+            gui_window._on_key(d)
+        gui_window._on_key("#")
+        assert gui_window._cand_idx == 1
+        gui_window._on_key("#")
+        assert gui_window._cand_idx == 2
+
+    def test_candidate_cycling_wraps(self, gui_window):
+        for d in "4663":
+            gui_window._on_key(d)
+        n = len(gui_window._candidates)
+        for _ in range(n):
+            gui_window._on_key("#")
+        assert gui_window._cand_idx == 0
+
+    # ── Confirm (Space / 0 key) ───────────────────────────────────────────────
+
+    def test_space_confirms_top_candidate(self, gui_window):
+        for d in "4663":
+            gui_window._on_key(d)
+        first_word = gui_window._candidates[0].word
+        gui_window._on_key("0")
+        assert first_word in gui_window._committed
+        assert gui_window._digit_buf == ""
+        assert gui_window._candidates == []
+
+    def test_confirm_updates_session_context(self, gui_window):
+        for d in "4663":
+            gui_window._on_key(d)
+        gui_window._on_key("0")
+        assert len(gui_window._session.context) == 1
+
+    def test_confirm_with_hash_selects_alt_candidate(self, gui_window):
+        for d in "4663":
+            gui_window._on_key(d)
+        gui_window._on_key("#")  # advance to index 1
+        second_word = gui_window._candidates[1].word
+        gui_window._on_key("0")
+        assert second_word in gui_window._committed
+
+    # ── Backspace ─────────────────────────────────────────────────────────────
+
+    def test_backspace_removes_last_digit(self, gui_window):
+        for d in "4663":
+            gui_window._on_key(d)
+        gui_window._on_key("*")
+        assert gui_window._digit_buf == "466"
+
+    def test_backspace_clears_buffer_fully(self, gui_window):
+        gui_window._on_key("4")
+        gui_window._on_key("*")
+        assert gui_window._digit_buf == ""
+        assert gui_window._candidates == []
+
+    def test_backspace_on_empty_buffer_after_word_restores_word(self, gui_window):
+        """Backspace after confirming a word should restore it into the buffer."""
+        for d in "4663":
+            gui_window._on_key(d)
+        confirmed_word = gui_window._candidates[0].word
+        gui_window._on_key("0")  # confirm + append space → "word "
+        # The committed text ends with a space; one backspace peels off the
+        # space AND the word together, restoring its digit sequence to the buffer.
+        gui_window._on_key("*")
+        from ai_t9.t9_map import word_to_digits
+        expected_digits = word_to_digits(confirmed_word)
+        assert gui_window._digit_buf == expected_digits
+        assert gui_window._session.context == []
+
+    def test_backspace_on_empty_does_nothing(self, gui_window):
+        gui_window._on_key("*")
+        assert gui_window._digit_buf == ""
+        assert gui_window._committed == ""
+
+    # ── Punctuation key (1) ───────────────────────────────────────────────────
+
+    def test_punct_key_appends_punctuation(self, gui_window):
+        gui_window._on_key("1")
+        assert gui_window._committed != ""
+        first = gui_window._committed
+        gui_window._on_key("1")
+        assert gui_window._committed != first  # cycled to next punct
+
+    def test_punct_cycles_through_all_entries(self, gui_window):
+        from examples.gui_demo import PUNCT_CYCLE
+        for _ in range(len(PUNCT_CYCLE)):
+            gui_window._on_key("1")
+        # After a full cycle the index wraps; another press gives first punct again
+        gui_window._on_key("1")
+        assert gui_window._committed[-1] == PUNCT_CYCLE[0]
+
+    # ── Clear all ─────────────────────────────────────────────────────────────
+
+    def test_clear_all_resets_everything(self, gui_window):
+        for d in "4663":
+            gui_window._on_key(d)
+        gui_window._on_key("0")
+        gui_window._clear_all()
+        assert gui_window._digit_buf == ""
+        assert gui_window._committed == ""
+        assert gui_window._candidates == []
+        assert gui_window._session.context == []
+
+    # ── Mode toggle ───────────────────────────────────────────────────────────
+
+    def test_toggle_mode_flips_state(self, gui_window):
+        assert gui_window._mode == gui_window._MODE_T9
+        gui_window._toggle_mode()
+        assert gui_window._mode == gui_window._MODE_ABC
+        gui_window._toggle_mode()
+        assert gui_window._mode == gui_window._MODE_T9
+
+    def test_toggle_mode_flushes_digit_buffer(self, gui_window):
+        for d in "466":
+            gui_window._on_key(d)
+        gui_window._toggle_mode()
+        # Partial buffer with no confirmed candidates is discarded
+        assert gui_window._digit_buf == ""
+
+    # ── ABC (multi-tap) mode ──────────────────────────────────────────────────
+
+    def test_abc_key_sets_pending(self, gui_window):
+        gui_window._toggle_mode()
+        gui_window._on_key("2")  # first tap → 'a'
+        assert gui_window._mt_pending == "a"
+        assert gui_window._mt_digit == "2"
+
+    def test_abc_same_key_cycles_letters(self, gui_window):
+        gui_window._toggle_mode()
+        gui_window._on_key("2")  # a
+        gui_window._on_key("2")  # b
+        assert gui_window._mt_pending == "b"
+        gui_window._on_key("2")  # c
+        assert gui_window._mt_pending == "c"
+        gui_window._on_key("2")  # wrap back to a
+        assert gui_window._mt_pending == "a"
+
+    def test_abc_different_key_commits_previous(self, gui_window):
+        gui_window._toggle_mode()
+        gui_window._mt_timer.stop()   # disable auto-commit timer
+        gui_window._on_key("2")       # pending = 'a'
+        # Simulate timer not firing; press a different key
+        gui_window._mt_timer.stop()
+        gui_window._on_key("3")       # should commit 'a', pending = 'd'
+        assert "a" in gui_window._committed
+        assert gui_window._mt_pending == "d"
+
+    def test_abc_space_commits_pending(self, gui_window):
+        gui_window._toggle_mode()
+        gui_window._mt_timer.stop()
+        gui_window._on_key("4")       # pending = 'g'
+        gui_window._on_key("0")       # space confirms
+        assert "g" in gui_window._committed
+        assert gui_window._committed.endswith(" ")
+        assert gui_window._mt_pending == ""
+
+    def test_abc_backspace_removes_pending(self, gui_window):
+        gui_window._toggle_mode()
+        gui_window._mt_timer.stop()
+        gui_window._on_key("2")
+        gui_window._on_key("*")       # backspace cancels pending letter
+        assert gui_window._mt_pending == ""
+        assert gui_window._committed == ""
+
+    def test_abc_backspace_removes_committed_char(self, gui_window):
+        gui_window._toggle_mode()
+        gui_window._mt_timer.stop()
+        gui_window._on_key("2")
+        gui_window._on_key("0")       # commit 'a' + space
+        gui_window._on_key("*")       # removes space
+        assert gui_window._committed == "a"
+
+    def test_abc_hash_uppercases_pending(self, gui_window):
+        gui_window._toggle_mode()
+        gui_window._mt_timer.stop()
+        gui_window._on_key("2")       # pending = 'a'
+        gui_window._on_key("#")       # uppercase toggle
+        assert gui_window._mt_pending == "A"
+        gui_window._on_key("#")       # toggle back
+        assert gui_window._mt_pending == "a"
+
+    # ── Clipboard copy ────────────────────────────────────────────────────────
+
+    def test_copy_to_clipboard_includes_committed(self, qt_app, gui_window):
+        from PyQt6.QtGui import QGuiApplication
+        gui_window._committed = "hello "
+        for d in "4663":
+            gui_window._on_key(d)
+        # Active candidate should be appended
+        gui_window._copy_to_clipboard()
+        clipped = QGuiApplication.clipboard().text()
+        assert clipped.startswith("hello ")
+        assert len(clipped) > len("hello ")
+
+    # ── Long-press ───────────────────────────────────────────────────────────
+
+    def test_long_press_star_clears_all(self, gui_window):
+        for d in "4663":
+            gui_window._on_key(d)
+        gui_window._on_long_press("*")
+        assert gui_window._committed == ""
+        assert gui_window._digit_buf == ""
+
+    def test_long_press_hash_inserts_newline(self, gui_window):
+        gui_window._on_long_press("#")
+        assert "\n" in gui_window._committed

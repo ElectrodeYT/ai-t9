@@ -16,6 +16,7 @@ dependencies = [
 [project.optional-dependencies]
 train = ["torch>=2.0"]
 dev = ["pytest>=7.0", "torch>=2.0"]
+gui = ["PyQt6>=6.4"]
 
 [project.scripts]
 ai-t9-build-vocab = "ai_t9._scripts.build_vocab:main"

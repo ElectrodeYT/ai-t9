@@ -494,7 +494,8 @@ class DualEncoderTrainer:
                         f"{done}/{n_batches}  "
                         f"loss={avg_loss:.4f}  "
                         f"ETA: {_format_eta(epoch_eta)}  "
-                        f"[total: {_format_eta(total_eta)}]",
+                        f"[total: {_format_eta(total_eta)}]"
+                        "\033[K",
                         end="", flush=True,
                     )
 
@@ -506,7 +507,7 @@ class DualEncoderTrainer:
                 print(
                     f"\r  Epoch {epoch}/{epochs}  loss={avg_loss:.4f}  "
                     f"time={elapsed:.1f}s  ({pairs_per_sec:,.0f} pairs/s)"
-                    + " " * 40
+                    "\033[K"
                 )
 
         if verbose:

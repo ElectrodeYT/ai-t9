@@ -22,7 +22,7 @@ Architecture overview::
     │    • ai-t9-train --load-pairs /vol/pairs.npz --output /vol/   │
     │    • optionally trains bigram model                           │
     └────────────────────────┬───────────────────────────────────────┘
-                             │ model.npz + bigram.json on Volume
+                             │ model.npz + bigram.npz on Volume
     ┌────────────────────────▼───────────────────────────────────────┐
     │  download  (local entrypoint)                                 │
     │    • copies artifacts from Volume to local data/              │
@@ -98,8 +98,10 @@ DEFAULT_SEED = 42
 
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
-# Base image: Debian slim + ai-t9 installed from the local source tree.
-# The full src/ directory is copied so that entry-point scripts are available.
+# Base image: bakes in pip dependencies and entry-point scripts.
+# Only rebuilt when the pip package list or pyproject.toml changes — NOT on
+# every source edit.  Source changes are picked up at invocation time via
+# _source_mount below.
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -113,6 +115,7 @@ image = (
     .add_local_file("pyproject.toml", "/root/pyproject.toml", copy=True)
     .add_local_file("README.md", "/root/README.md", copy=True)
     .run_commands("pip install --no-deps -e /root")
+    .add_local_python_source("ai_t9")
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -234,7 +237,7 @@ class Trainer:
         """Train the DualEncoder on GPU from precomputed pairs.
 
         Reads ``vocab.json`` and ``pairs.npz`` from the Volume, writes
-        ``model.npz`` (and optionally ``bigram.json``) back.
+        ``model.npz`` (and optionally ``bigram.npz``) back.
 
         Returns a summary string.
         """
@@ -279,7 +282,7 @@ class Trainer:
                 "--vocab", f"{VOLUME_PATH}/vocab.json",
                 "--corpus", str(corpus_dir),
                 "--output", "/dev/null",   # model output discarded; we already have it
-                "--save-ngram", f"{VOLUME_PATH}/bigram.json",
+                "--save-ngram", f"{VOLUME_PATH}/bigram.npz",
                 "--epochs", "1",
             ]
             print("\n=== Training bigram model ===")
@@ -288,7 +291,7 @@ class Trainer:
         volume.commit()
 
         artifacts: list[str] = []
-        for name in ("model.npz", "bigram.json", "vocab.json", "dict.json"):
+        for name in ("model.npz", "bigram.npz", "vocab.json", "dict.json"):
             p = Path(VOLUME_PATH) / name
             if p.exists():
                 size_mb = p.stat().st_size / 1e6
@@ -378,9 +381,9 @@ def list_volume() -> str:
 @app.local_entrypoint()
 def main(
     # Workflow control
-    skip_prep: bool = False,
-    prep_only: bool = False,
-    download_only: bool = False,
+    prep: bool = False,
+    train: bool = False,
+    download: bool = False,
     list_files: bool = False,
     # Ingest HuggingFace dataset
     ingest: str = "",
@@ -409,17 +412,18 @@ def main(
 ):
     """Orchestrate ai-t9 training on Modal.
 
-    By default runs the full pipeline: prep (CPU) → train (GPU) → download
-    artifacts to the local ``data/`` directory.
+    Pass a flag to enable a step in the workflow:
 
-    Workflow flags:
+      --ingest      Run ingest; add dataset to Volume.
+      --prep        Run prep; build vocab/dict/pairs from corpus on Volume.
+      --train       Run train; train model from precomputed pairs, then download.
+      --download    Download artifacts from the Volume.
 
-      --skip-prep        Skip vocab/pairs prep; assume Volume already has them.
-      --prep-only        Run prep only; don't train or download.
-      --download-only    Just download artifacts from the Volume.
+    Other flags:
+
       --list-files       List files on the Volume and exit.
 
-    Ingest a HuggingFace dataset to the Volume (runs before prep):
+    Ingest a HuggingFace dataset to the Volume:
 
       --ingest wikitext --ingest-config wikitext-103-raw-v1
 
@@ -430,7 +434,8 @@ def main(
 
     GPU selection:
 
-      --gpu L4           Cheap ($0.60/hr), good for iteration
+      --gpu L4           Cheap ($0.60/hr), good for iteration, but slow for training
+      --gpu A10          Midrange ($1.10/hr), good for larger models, faster than L4
       --gpu A100         Fast, 40 GB VRAM
       --gpu A100-80GB    Large vocab / big embed_dim
       --gpu H100         Fastest available
@@ -443,10 +448,15 @@ def main(
         print(list_volume.remote())
         return
 
-    # -- Ingest HuggingFace dataset ----------------------------------------
+    # If we are missing arguments for any workflow, print an error and exit.
+    if not (ingest or prep or train or download):
+        print("ERROR: No workflow specified. Use --ingest, --prep, --train, or --download.", file=sys.stderr)
+        raise SystemExit(1)
+
+    # -- Separate workflows ------------------------------------------------
     if ingest:
         if not ingest_config:
-            print(f"ERROR: --ingest-config is required when using --ingest")
+            print("ERROR: --ingest-config CONFIG required when using --ingest")
             raise SystemExit(1)
         result = ingest_hf.remote(
             dataset=ingest,
@@ -457,12 +467,10 @@ def main(
             max_lines=ingest_max_lines if ingest_max_lines > 0 else None,
         )
         print(result)
+        return
 
-    # -- Prep (CPU) --------------------------------------------------------
-    if not skip_prep and not download_only:
-        # When using volume corpus, read from /vol/corpuses/
-        # If ingest was used, corpus is on volume, so use_volume_corpus=True
-        effective_use_volume_corpus = use_volume_corpus or bool(ingest)
+    if prep:
+        effective_use_volume_corpus = use_volume_corpus  # Assume corpus is on volume for prep-only
         result = prep.remote(
             context_window=context_window,
             max_words=max_words,
@@ -470,11 +478,9 @@ def main(
             use_volume_corpus=effective_use_volume_corpus,
         )
         print(result)
-        if prep_only:
-            return
+        return
 
-    # -- Train (GPU) -------------------------------------------------------
-    if not prep_only and not download_only:
+    if train:
         # Override the GPU at invocation time via with_options on the Cls
         trainer = Trainer.with_options(gpu=gpu)()
         result = trainer.run.remote(
@@ -488,28 +494,48 @@ def main(
             save_ngram=not no_ngram,
         )
         print(result)
+        # Download artifacts
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        artifact_names = ["vocab.json", "dict.json", "model.npz", "bigram.npz"]
+        print(f"\nDownloading artifacts to {out}/")
+        for name in artifact_names:
+            remote_path = name
+            local_path = out / name
+            try:
+                subprocess.run(
+                    ["modal", "volume", "get", VOLUME_NAME, remote_path, str(local_path)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                size_mb = local_path.stat().st_size / 1e6
+                print(f"  {name}: {size_mb:.1f} MB")
+            except subprocess.CalledProcessError:
+                print(f"  {name}: (not found on volume, skipping)")
+        print("Done.")
+        return
 
-    # -- Download artifacts ------------------------------------------------
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    if download:
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        artifact_names = ["vocab.json", "dict.json", "model.npz", "bigram.npz"]
+        print(f"Downloading artifacts to {out}/")
+        for name in artifact_names:
+            remote_path = name
+            local_path = out / name
+            try:
+                subprocess.run(
+                    ["modal", "volume", "get", VOLUME_NAME, remote_path, str(local_path)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                size_mb = local_path.stat().st_size / 1e6
+                print(f"  {name}: {size_mb:.1f} MB")
+            except subprocess.CalledProcessError:
+                print(f"  {name}: (not found on volume, skipping)")
+        print("Done downloading artifacts.")
+        return
 
-    artifact_names = ["vocab.json", "dict.json", "model.npz", "bigram.json"]
-    print(f"\nDownloading artifacts to {out}/")
-
-    # Use the Modal CLI to download from the volume.
-    for name in artifact_names:
-        remote_path = name
-        local_path = out / name
-        try:
-            subprocess.run(
-                ["modal", "volume", "get", VOLUME_NAME, remote_path, str(local_path)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            size_mb = local_path.stat().st_size / 1e6
-            print(f"  {name}: {size_mb:.1f} MB")
-        except subprocess.CalledProcessError:
-            print(f"  {name}: (not found on volume, skipping)")
-
-    print("Done.")
+    print("Done running workflow.")

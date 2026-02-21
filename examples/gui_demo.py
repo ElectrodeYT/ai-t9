@@ -1561,10 +1561,12 @@ class T9PhoneWindow(QMainWindow):
         if self._digit_buf:
             try:
                 self._candidates, self._last_trace = (
-                    self._predictor.predict_with_trace(
+                    self._predictor.predict(
                         self._digit_buf,
                         context=self._session.context,
                         top_k=self._top_k,
+                        trace=True,
+                        completions=True
                     )
                 )
             except ValueError:

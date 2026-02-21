@@ -99,8 +99,12 @@ class T9Predictor:
         digit_seq: str,
         context: Sequence[str] = (),
         top_k: int = 5,
+        completions: bool = False,
+        max_extra_digits: int = 6,
+        w_length: float = 0.30,
         return_details: bool = False,
-    ) -> list[str] | list[RankedCandidate]:
+        trace: bool = False,
+    ) -> "list[str] | list[RankedCandidate] | tuple[list[RankedCandidate], dict]":
         """Return the top-k predicted words for the given digit sequence.
 
         Args:
@@ -108,74 +112,28 @@ class T9Predictor:
             context:        Previously typed words (most recent last),
                             e.g. ``["i", "am", "going"]``
             top_k:          Number of results to return (default 5)
+            completions:    If True, predict completions extending the digit prefix
+                            instead of exact matches.
+            max_extra_digits: Maximum extra digits for completions (ignored if completions=False)
+            w_length:       Weight for length bonus in completions (ignored if completions=False)
             return_details: If True, return RankedCandidate objects with score
                             breakdown instead of plain strings.
+            trace:          If True, return a tuple of (ranked_candidates, trace_dict)
+                            instead of just the results. Forces return_details=True.
 
         Returns:
-            List of word strings (default) or RankedCandidate objects.
+            List of word strings (default) or RankedCandidate objects, or tuple with trace.
         """
-        if not is_valid_digit_sequence(digit_seq):
-            raise ValueError(
-                f"Invalid digit sequence {digit_seq!r}. "
-                "Use digits 2-9 only (T9 keypad)."
-            )
-
-        candidates = self._dict.lookup(digit_seq)
-        if not candidates:
-            return []
-
-        words, word_ids = zip(*candidates)
-        word_ids_list = list(word_ids)
-
-        # ---- freq score ------------------------------------------------
-        freq_scores = np.array(
-            [self._vocab.logfreq(wid) for wid in word_ids_list], dtype=np.float32
+        return self._predict_core(
+            digit_seq=digit_seq,
+            context=context,
+            top_k=top_k,
+            is_completions=completions,
+            max_extra_digits=max_extra_digits,
+            w_length=w_length,
+            return_details=return_details,
+            trace=trace,
         )
-        freq_scores = _normalise(freq_scores)
-
-        # ---- model score -----------------------------------------------
-        if self._model is not None and self._wm > 0:
-            ctx_ids = self._vocab.words_to_ids(list(context))
-            raw_model = self._model.score_candidates(ctx_ids, word_ids_list)
-            model_scores = _normalise(raw_model)
-        else:
-            model_scores = np.zeros(len(word_ids_list), dtype=np.float32)
-
-        # ---- ngram score -----------------------------------------------
-        if self._ngram is not None and self._wn > 0 and context:
-            prev_id = self._vocab.word_to_id(context[-1].lower())
-            raw_ngram = np.array(
-                self._ngram.score_candidates(prev_id, word_ids_list), dtype=np.float32
-            )
-            ngram_scores = _normalise(raw_ngram)
-        else:
-            ngram_scores = np.zeros(len(word_ids_list), dtype=np.float32)
-
-        # ---- combine ---------------------------------------------------
-        final = (
-            self._wf * freq_scores
-            + self._wm * model_scores
-            + self._wn * ngram_scores
-        )
-
-        # Sort descending
-        order = np.argsort(-final)
-        top_indices = order[:top_k]
-
-        if return_details:
-            return [
-                RankedCandidate(
-                    word=words[i],
-                    word_id=word_ids_list[i],
-                    freq_score=float(freq_scores[i]),
-                    model_score=float(model_scores[i]),
-                    ngram_score=float(ngram_scores[i]),
-                    final_score=float(final[i]),
-                )
-                for i in top_indices
-            ]
-        else:
-            return [words[i] for i in top_indices]
 
     def predict_completions(
         self,
@@ -213,80 +171,16 @@ class T9Predictor:
         Returns:
             List of word strings (default) or RankedCandidate objects.
         """
-        if not is_valid_digit_sequence(digit_prefix):
-            raise ValueError(
-                f"Invalid digit sequence {digit_prefix!r}. "
-                "Use digits 2-9 only (T9 keypad)."
-            )
-
-        candidates = self._dict.prefix_lookup(
-            digit_prefix,
+        return self.predict(
+            digit_seq=digit_prefix,
+            context=context,
+            top_k=top_k,
+            completions=True,
             max_extra_digits=max_extra_digits,
+            w_length=w_length,
+            return_details=return_details,
+            trace=False,
         )
-        if not candidates:
-            return []
-
-        words, word_ids, full_digits = zip(*candidates)
-        word_ids_list = list(word_ids)
-
-        # ---- freq score ------------------------------------------------
-        freq_scores = np.array(
-            [self._vocab.logfreq(wid) for wid in word_ids_list], dtype=np.float32
-        )
-        freq_scores = _normalise(freq_scores)
-
-        # ---- model score -----------------------------------------------
-        if self._model is not None and self._wm > 0:
-            ctx_ids = self._vocab.words_to_ids(list(context))
-            raw_model = self._model.score_candidates(ctx_ids, word_ids_list)
-            model_scores = _normalise(raw_model)
-        else:
-            model_scores = np.zeros(len(word_ids_list), dtype=np.float32)
-
-        # ---- ngram score -----------------------------------------------
-        if self._ngram is not None and self._wn > 0 and context:
-            prev_id = self._vocab.word_to_id(context[-1].lower())
-            raw_ngram = np.array(
-                self._ngram.score_candidates(prev_id, word_ids_list), dtype=np.float32
-            )
-            ngram_scores = _normalise(raw_ngram)
-        else:
-            ngram_scores = np.zeros(len(word_ids_list), dtype=np.float32)
-
-        # ---- completion length bonus -----------------------------------
-        # Shorter completions receive higher raw scores (negative extra digits
-        # makes short = high).  Rank normalisation produces the [0, 1] signal.
-        prefix_len = len(digit_prefix)
-        extra = np.array(
-            [len(fd) - prefix_len for fd in full_digits], dtype=np.float32
-        )
-        length_scores = _normalise(-extra)
-
-        # ---- combine ---------------------------------------------------
-        base_blend = (
-            self._wf * freq_scores
-            + self._wm * model_scores
-            + self._wn * ngram_scores
-        )
-        w_len = max(0.0, min(float(w_length), 0.99))
-        final = (1.0 - w_len) * base_blend + w_len * length_scores
-
-        order = np.argsort(-final)
-        top_indices = order[:top_k]
-
-        if return_details:
-            return [
-                RankedCandidate(
-                    word=words[i],
-                    word_id=word_ids_list[i],
-                    freq_score=float(freq_scores[i]),
-                    model_score=float(model_scores[i]),
-                    ngram_score=float(ngram_scores[i]),
-                    final_score=float(final[i]),
-                )
-                for i in top_indices
-            ]
-        return [words[i] for i in top_indices]
 
     def predict_with_trace(
         self,
@@ -319,66 +213,103 @@ class T9Predictor:
             timing_ms       – wall-clock ms for each pipeline stage;
                               keys: "dict", "freq", "model", "ngram", "blend", "total"
         """
+        result = self.predict(
+            digit_seq=digit_seq,
+            context=context,
+            top_k=top_k,
+            completions=False,
+            return_details=True,
+            trace=True,
+        )
+        assert isinstance(result, tuple)
+        return result
+
+    def _predict_core(
+        self,
+        digit_seq: str,
+        context: Sequence[str],
+        top_k: int,
+        is_completions: bool,
+        max_extra_digits: int = 6,
+        w_length: float = 0.30,
+        return_details: bool = False,
+        trace: bool = False,
+    ) -> "list[str] | list[RankedCandidate] | tuple[list[RankedCandidate], dict]":
+        """Core prediction logic shared by all public methods."""
         if not is_valid_digit_sequence(digit_seq):
             raise ValueError(
                 f"Invalid digit sequence {digit_seq!r}. "
                 "Use digits 2-9 only (T9 keypad)."
             )
 
-        _t0 = time.perf_counter_ns()
+        _t0 = time.perf_counter_ns() if trace else 0
 
         # ── Stage 1: dict lookup ──────────────────────────────────────
-        _td0 = time.perf_counter_ns()
-        candidates = self._dict.lookup(digit_seq)
-        _td1 = time.perf_counter_ns()
+        _td0 = time.perf_counter_ns() if trace else 0
+        if is_completions:
+            candidates = self._dict.prefix_lookup(digit_seq, max_extra_digits=max_extra_digits)
+            if candidates:
+                words, word_ids, full_digits = zip(*candidates)
+            else:
+                words, word_ids, full_digits = (), (), ()
+        else:
+            candidates = self._dict.lookup(digit_seq)
+            if candidates:
+                words, word_ids = zip(*candidates)
+                full_digits = None
+            else:
+                words, word_ids, full_digits = (), (), None
+        _td1 = time.perf_counter_ns() if trace else 0
 
         if not candidates:
-            empty_trace: dict = {
-                "digit_seq": digit_seq,
-                "context": list(context),
-                "dict_hits": 0,
-                "candidates_raw": [],
-                "freq_raw": np.array([], dtype=np.float32),
-                "freq_norm": np.array([], dtype=np.float32),
-                "model_raw": None,
-                "model_norm": None,
-                "ngram_raw": None,
-                "ngram_norm": None,
-                "final": np.array([], dtype=np.float32),
-                "order": np.array([], dtype=np.intp),
-                "weights": self.weights,
-                "timing_ms": {
-                    "dict": (_td1 - _td0) / 1e6,
-                    "freq": 0.0, "model": 0.0, "ngram": 0.0, "blend": 0.0,
-                    "total": (time.perf_counter_ns() - _t0) / 1e6,
-                },
-            }
-            return [], empty_trace
+            if trace:
+                empty_trace: dict = {
+                    "digit_seq": digit_seq,
+                    "context": list(context),
+                    "dict_hits": 0,
+                    "candidates_raw": [],
+                    "freq_raw": np.array([], dtype=np.float32),
+                    "freq_norm": np.array([], dtype=np.float32),
+                    "model_raw": None,
+                    "model_norm": None,
+                    "ngram_raw": None,
+                    "ngram_norm": None,
+                    "final": np.array([], dtype=np.float32),
+                    "order": np.array([], dtype=np.intp),
+                    "weights": self.weights,
+                    "timing_ms": {
+                        "dict": (_td1 - _td0) / 1e6 if trace else 0.0,
+                        "freq": 0.0, "model": 0.0, "ngram": 0.0, "blend": 0.0,
+                        "total": (time.perf_counter_ns() - _t0) / 1e6 if trace else 0.0,
+                    },
+                }
+                return [], empty_trace
+            else:
+                return []
 
-        words, word_ids = zip(*candidates)
         word_ids_list = list(word_ids)
 
         # ── Stage 2: frequency scoring ────────────────────────────────
-        _tf0 = time.perf_counter_ns()
+        _tf0 = time.perf_counter_ns() if trace else 0
         freq_raw = np.array(
             [self._vocab.logfreq(wid) for wid in word_ids_list], dtype=np.float32
         )
         freq_norm = _normalise(freq_raw)
-        _tf1 = time.perf_counter_ns()
+        _tf1 = time.perf_counter_ns() if trace else 0
 
         # ── Stage 3: model scoring ────────────────────────────────────
-        _tm0 = time.perf_counter_ns()
+        _tm0 = time.perf_counter_ns() if trace else 0
         if self._model is not None and self._wm > 0:
             ctx_ids = self._vocab.words_to_ids(list(context))
             model_raw = self._model.score_candidates(ctx_ids, word_ids_list)
             model_norm = _normalise(model_raw)
         else:
             model_raw = None
-            model_norm = None
-        _tm1 = time.perf_counter_ns()
+            model_norm = np.zeros(len(word_ids_list), dtype=np.float32)
+        _tm1 = time.perf_counter_ns() if trace else 0
 
         # ── Stage 4: ngram scoring ────────────────────────────────────
-        _tn0 = time.perf_counter_ns()
+        _tn0 = time.perf_counter_ns() if trace else 0
         if self._ngram is not None and self._wn > 0 and context:
             prev_id = self._vocab.word_to_id(context[-1].lower())
             ngram_raw = np.array(
@@ -387,15 +318,32 @@ class T9Predictor:
             ngram_norm = _normalise(ngram_raw)
         else:
             ngram_raw = None
-            ngram_norm = None
-        _tn1 = time.perf_counter_ns()
+            ngram_norm = np.zeros(len(word_ids_list), dtype=np.float32)
+        _tn1 = time.perf_counter_ns() if trace else 0
 
-        # ── Stage 5: blend + sort ─────────────────────────────────────
-        _tb0 = time.perf_counter_ns()
-        mn = model_norm if model_norm is not None else np.zeros(len(word_ids_list), dtype=np.float32)
-        nn = ngram_norm if ngram_norm is not None else np.zeros(len(word_ids_list), dtype=np.float32)
+        # ── Stage 5: length bonus (completions only) ──────────────────
+        if is_completions:
+            prefix_len = len(digit_seq)
+            extra = np.array(
+                [len(fd) - prefix_len for fd in full_digits], dtype=np.float32
+            )
+            length_norm = _normalise(-extra)
+        else:
+            length_norm = None
 
-        final = self._wf * freq_norm + self._wm * mn + self._wn * nn
+        # ── Stage 6: blend + sort ─────────────────────────────────────
+        _tb0 = time.perf_counter_ns() if trace else 0
+        base_blend = (
+            self._wf * freq_norm
+            + self._wm * model_norm
+            + self._wn * ngram_norm
+        )
+        if is_completions:
+            w_len = max(0.0, min(float(w_length), 0.99))
+            final = (1.0 - w_len) * base_blend + w_len * length_norm
+        else:
+            final = base_blend
+
         order = np.argsort(-final)
         top_indices = order[:top_k]
 
@@ -404,40 +352,45 @@ class T9Predictor:
                 word=words[i],
                 word_id=word_ids_list[i],
                 freq_score=float(freq_norm[i]),
-                model_score=float(mn[i]),
-                ngram_score=float(nn[i]),
+                model_score=float(model_norm[i]),
+                ngram_score=float(ngram_norm[i]),
                 final_score=float(final[i]),
             )
             for i in top_indices
         ]
-        _tb1 = time.perf_counter_ns()
-        _t1  = time.perf_counter_ns()
+        _tb1 = time.perf_counter_ns() if trace else 0
+        _t1 = time.perf_counter_ns() if trace else 0
 
-        trace: dict = {
-            "digit_seq": digit_seq,
-            "context": list(context),
-            "dict_hits": len(candidates),
-            "candidates_raw": list(zip(words, word_ids_list)),
-            "freq_raw": freq_raw,
-            "freq_norm": freq_norm,
-            "model_raw": model_raw,
-            "model_norm": model_norm,
-            "ngram_raw": ngram_raw,
-            "ngram_norm": ngram_norm,
-            "final": final,
-            "order": order,
-            "weights": self.weights,
-            "timing_ms": {
-                "dict":  (_td1 - _td0) / 1e6,
-                "freq":  (_tf1 - _tf0) / 1e6,
-                "model": (_tm1 - _tm0) / 1e6,
-                "ngram": (_tn1 - _tn0) / 1e6,
-                "blend": (_tb1 - _tb0) / 1e6,
-                "total": (_t1  - _t0)  / 1e6,
-            },
-        }
+        if trace:
+            trace_dict: dict = {
+                "digit_seq": digit_seq,
+                "context": list(context),
+                "dict_hits": len(candidates),
+                "candidates_raw": list(zip(words, word_ids_list)),
+                "freq_raw": freq_raw,
+                "freq_norm": freq_norm,
+                "model_raw": model_raw,
+                "model_norm": model_norm if model_raw is not None else None,
+                "ngram_raw": ngram_raw,
+                "ngram_norm": ngram_norm if ngram_raw is not None else None,
+                "final": final,
+                "order": order,
+                "weights": self.weights,
+                "timing_ms": {
+                    "dict": (_td1 - _td0) / 1e6,
+                    "freq": (_tf1 - _tf0) / 1e6,
+                    "model": (_tm1 - _tm0) / 1e6,
+                    "ngram": (_tn1 - _tn0) / 1e6,
+                    "blend": (_tb1 - _tb0) / 1e6,
+                    "total": (_t1 - _t0) / 1e6,
+                },
+            }
+            return ranked, trace_dict
 
-        return ranked, trace
+        if return_details:
+            return ranked
+        else:
+            return [rc.word for rc in ranked]
 
     # ------------------------------------------------------------------
     # Introspection

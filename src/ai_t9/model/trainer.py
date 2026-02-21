@@ -4,10 +4,11 @@ This module is intentionally isolated from the inference path — PyTorch is an
 optional dependency (pip install ai-t9[train]).  The output is a .npz file
 that the pure-NumPy DualEncoder can load without any ML framework.
 
-Training objective: candidate-only negative sampling
+Training objective: frequency-weighted negative sampling
   For each (context_words, target_word) pair drawn from the corpus:
     - Score the positive (target) word against the context embedding
-    - Sample `neg_samples` random negatives *on the GPU* with torch.randint
+    - Sample `neg_samples` negatives *on the GPU* using a frequency-weighted
+      distribution (f^0.75, as in Word2Vec), via torch.multinomial
     - Apply binary cross-entropy (positive=1, negatives=0)
 
 GPU utilisation design
@@ -188,12 +189,13 @@ def _set_cuda_blocking_sync() -> bool:
 class _TorchDualEncoder:
     """Two nn.Embedding tables with on-GPU negative sampling.
 
-    The key method is score_with_negatives(), which generates all negative
-    candidate IDs with a single torch.randint() call on the GPU, avoiding
-    any Python loop for negatives.
+    Uses frequency-weighted negative sampling (Word2Vec-style f^0.75
+    distribution) for better embedding quality.  The sampling weight table
+    is pre-computed once and stored on the GPU device.
     """
 
-    def __init__(self, vocab_size: int, embed_dim: int, neg_samples: int, torch, device):
+    def __init__(self, vocab_size: int, embed_dim: int, neg_samples: int,
+                 torch, device, neg_weights: "torch.Tensor | None" = None):
         self._vocab_size = vocab_size
         self._neg_samples = neg_samples
         nn = torch.nn
@@ -201,6 +203,13 @@ class _TorchDualEncoder:
         self.wrd_embed = nn.Embedding(vocab_size, embed_dim).to(device)
         nn.init.xavier_uniform_(self.ctx_embed.weight)
         nn.init.xavier_uniform_(self.wrd_embed.weight)
+
+        # Frequency-weighted negative sampling distribution.
+        # If no weights are provided, fall back to uniform sampling.
+        if neg_weights is not None:
+            self._neg_weights = neg_weights.to(device)
+        else:
+            self._neg_weights = None
 
     def parameters(self):
         return list(self.ctx_embed.parameters()) + list(self.wrd_embed.parameters())
@@ -227,8 +236,16 @@ class _TorchDualEncoder:
         pos_vecs   = F.normalize(self.wrd_embed(pos_ids), dim=-1)
         pos_scores = (ctx_vecs * pos_vecs).sum(-1, keepdim=True)
 
-        # Negative IDs generated entirely on the GPU — no Python loop
-        neg_ids   = torch.randint(1, self._vocab_size, (batch, self._neg_samples), device=device)
+        # Negative IDs: frequency-weighted sampling (f^0.75) when available,
+        # uniform fallback otherwise.  Both run entirely on the GPU.
+        if self._neg_weights is not None:
+            neg_ids = torch.multinomial(
+                self._neg_weights.expand(batch, -1),
+                self._neg_samples,
+                replacement=True,
+            )
+        else:
+            neg_ids = torch.randint(1, self._vocab_size, (batch, self._neg_samples), device=device)
         neg_vecs  = F.normalize(self.wrd_embed(neg_ids), dim=-1)          # (batch, neg, dim)
         neg_scores = torch.bmm(neg_vecs, ctx_vecs.unsqueeze(-1)).squeeze(-1)  # (batch, neg)
 
@@ -490,8 +507,22 @@ class DualEncoderTrainer:
         # NOTE: On CUDA the first .to(device) call triggers driver initialisation
         # which can block for 10–30 s.  This is a one-time cost per process.
         vocab_size = self._vocab.size
+
+        # Build frequency-weighted negative sampling distribution (f^0.75).
+        # This follows the Word2Vec insight: sampling negatives proportional
+        # to f(w)^0.75 makes the model work harder on common words and
+        # produces significantly better embeddings than uniform sampling.
+        logfreqs = np.array(self._vocab.logfreq_array(), dtype=np.float32)
+        raw_freqs = np.exp(logfreqs)
+        neg_w = np.power(raw_freqs, 0.75)
+        neg_w[0] = 0.0  # never sample UNK as a negative
+        neg_w /= neg_w.sum()
+        neg_weights = torch.from_numpy(neg_w).to(device)
+        self._phase("negative sampling weights computed", t_ref)
+
         model = _TorchDualEncoder(
-            vocab_size, self._embed_dim, self._neg_samples, torch, device
+            vocab_size, self._embed_dim, self._neg_samples, torch, device,
+            neg_weights=neg_weights,
         )
         self._model = model
         self._phase(f"model created and moved to {device}", t_ref)

@@ -12,32 +12,35 @@ Training objective: candidate-only negative sampling
 
 GPU utilisation design
 -----------------------
-The original bottleneck was that negative sampling happened in a Python loop
-on the CPU, which kept the GPU mostly idle waiting for data.  The current
-design removes that bottleneck with three changes:
+1. Pre-computed pairs — all (context, target) pairs are materialised as flat
+   NumPy arrays *once* before training.  Each epoch shuffles via a NumPy
+   permutation (which releases the GIL) and converts to a pinned-memory
+   tensor in one step.  Batches are then simple O(1) tensor slices — no
+   Python generator or per-batch array construction, eliminating the main
+   GIL-contention bottleneck that kept the GPU starved for data.
 
-1. On-GPU negative sampling — torch.randint generates all negative IDs
+2. On-GPU negative sampling — torch.randint generates all negative IDs
    directly on the GPU; only (ctx_ids, pos_ids) are transferred from CPU,
    roughly 20× less data per batch than before.
 
-2. Background prefetch thread — a daemon thread runs pair generation and
-   numpy array construction while the GPU processes the previous batch,
-   overlapping CPU and GPU work.
+3. Pinned memory + non-blocking transfers (CUDA only) — the full shuffled
+   epoch tensor is pinned once; batch slices inherit the pinned status
+   and transfer via DMA without per-batch OS allocation overhead.
 
-3. Pinned memory + non-blocking transfers (CUDA only) — page-locked CPU
-   buffers allow the DMA engine to copy data asynchronously, letting the
-   CPU continue to the next batch immediately after issuing the transfer.
+4. Automatic mixed precision (AMP) — on CUDA, forward passes run in float16
+   via torch.amp.autocast, roughly doubling throughput for embedding lookups
+   and matrix operations.  A GradScaler prevents float16 gradient underflow.
+
+5. TF32 matmul (Ampere+ GPUs) — float32 matrix multiplications use
+   TensorFloat-32 for ~3× speed at effectively no accuracy cost.
 """
 
 from __future__ import annotations
 
 import math
-import queue
 import random
-import threading
 import time
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
 
@@ -172,63 +175,45 @@ def _corpus_file_sentence_ids(path: Path, vocab: Vocabulary) -> list[list[int]]:
     return sentences
 
 
-def _generate_training_pairs(
+def _precompute_pairs(
     sentences: list[list[int]],
-    context_window: int = 3,
-) -> Iterator[tuple[list[int], int]]:
-    """Yield (context_word_ids, target_word_id) pairs from a sentence corpus."""
+    context_window: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pre-compute all (context, target) training pairs as flat NumPy arrays.
+
+    Called once before training.  The resulting arrays are shuffled per epoch
+    via NumPy index permutation (fast, releases the GIL).
+
+    Returns:
+        ctx_arr: int64 (n_pairs, context_window) — zero-padded on the left
+        pos_arr: int64 (n_pairs,)
+    """
+    n_pairs = sum(max(0, len(s) - 1) for s in sentences)
+    ctx_arr = np.zeros((n_pairs, context_window), dtype=np.int64)
+    pos_arr = np.empty(n_pairs, dtype=np.int64)
+    idx = 0
     for sent in sentences:
         for t in range(1, len(sent)):
             ctx_start = max(0, t - context_window)
-            yield sent[ctx_start:t], sent[t]
-
-
-# ---------------------------------------------------------------------------
-# Batch construction (CPU side — runs in prefetch thread)
-# ---------------------------------------------------------------------------
-
-def _build_arrays(
-    batch: list[tuple[list[int], int]],
-    context_window: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Convert a batch of (ctx_ids, pos_id) pairs to numpy arrays.
-
-    Returns:
-        ctx_arr: int64 array (batch, context_window) — zero-padded on the left
-        pos_arr: int64 array (batch,)
-    """
-    n = len(batch)
-    ctx_arr = np.zeros((n, context_window), dtype=np.int64)
-    pos_arr = np.empty(n, dtype=np.int64)
-    for i, (ctx_ids, pos_id) in enumerate(batch):
-        src = ctx_ids[-context_window:]          # at most context_window entries
-        ctx_arr[i, context_window - len(src):] = src  # right-align; left stays 0 (UNK)
-        pos_arr[i] = pos_id
+            src = sent[ctx_start:t]
+            ctx_arr[idx, context_window - len(src):] = src
+            pos_arr[idx] = sent[t]
+            idx += 1
     return ctx_arr, pos_arr
 
 
-def _prefetch_worker(
-    sentences: list[list[int]],
-    context_window: int,
-    batch_size: int,
-    out_q: "queue.Queue[tuple[np.ndarray, np.ndarray] | None]",
-) -> None:
-    """Background thread: generates training pairs and pushes numpy arrays.
-
-    Runs entirely on the CPU.  Pushes (ctx_arr, pos_arr) tuples into out_q,
-    then pushes None as a sentinel when all pairs for this epoch are exhausted.
-    The queue's maxsize limits how far ahead this thread can run, capping the
-    memory used by pre-built batches.
-    """
-    batch: list[tuple[list[int], int]] = []
-    for ctx_ids, target_id in _generate_training_pairs(sentences, context_window):
-        batch.append((ctx_ids, target_id))
-        if len(batch) >= batch_size:
-            out_q.put(_build_arrays(batch, context_window))
-            batch.clear()
-    if batch:
-        out_q.put(_build_arrays(batch, context_window))
-    out_q.put(None)  # sentinel — epoch is done
+def _format_eta(seconds: float) -> str:
+    """Format seconds into a compact human-readable duration."""
+    if seconds < 0:
+        return "?"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m{s:02d}s"
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +365,7 @@ class DualEncoderTrainer:
 
         torch.manual_seed(self._seed)
         random.seed(self._seed)
+        np_rng = np.random.default_rng(self._seed)
 
         # ---- Phase 2: model creation + .to(device) --------------------------
         # NOTE: On CUDA the first .to(device) call triggers driver initialisation
@@ -396,90 +382,133 @@ class DualEncoderTrainer:
         bce = torch.nn.BCEWithLogitsLoss()
         self._phase("optimizer ready", t_ref)
 
-        # ---- Phase 4: pair count (single pass, no allocation) ---------------
-        n_pairs = sum(max(0, len(s) - 1) for s in sentences)
-        self._phase(f"pair count done ({n_pairs:,} pairs)", t_ref)
+        # ---- Phase 4: pre-compute all training pairs as flat arrays ----------
+        # Done once; per-epoch shuffling uses numpy permutation (releases GIL).
+        ctx_all, pos_all = _precompute_pairs(sentences, self._context_window)
+        n_pairs = len(pos_all)
+        n_batches = math.ceil(n_pairs / self._batch_size)
+        self._phase(f"pairs pre-computed ({n_pairs:,} pairs)", t_ref)
 
-        # Pinned memory enables async DMA transfers on CUDA; a no-op elsewhere.
-        use_pin = str(device).startswith("cuda")
+        # AMP (automatic mixed precision) — CUDA only.  The GradScaler acts as
+        # a no-op when enabled=False, so no if/else branches are needed below.
+        is_cuda = str(device).startswith("cuda")
+        use_amp = is_cuda
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+        # TF32 matmul on Ampere+ GPUs (~3× faster float32 ops, negligible
+        # accuracy difference for embedding training).
+        if is_cuda and hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
 
         if verbose:
             print(
                 f"Device: {device}  |  training pairs: {n_pairs:,}  |  "
                 f"vocab: {vocab_size}  |  embed_dim: {self._embed_dim}  |  "
                 f"neg_samples: {self._neg_samples} (on GPU)  |  "
-                f"batch: {self._batch_size}  |  prefetch: {self._prefetch_batches}"
+                f"batch: {self._batch_size}  |  AMP: {'on' if use_amp else 'off'}"
             )
 
         # ---- Training epochs ------------------------------------------------
+        total_train_batches = n_batches * epochs
+        train_batches_done = 0
+        t_train = time.monotonic()
+        last_progress_t = 0.0
+        _PROGRESS_INTERVAL = 0.25       # seconds between progress-bar redraws
+
         for epoch in range(1, epochs + 1):
-            random.shuffle(sentences)
             t_epoch = time.monotonic()
             total_loss = 0.0
-            n_batches = 0
 
-            # Start prefetch thread for this epoch.
-            # maxsize caps how many batches the thread can build ahead, bounding
-            # the extra RAM used (each batch is batch_size * context_window * 8 bytes).
-            prefetch_q: queue.Queue = queue.Queue(maxsize=self._prefetch_batches)
-            prefetch_t = threading.Thread(
-                target=_prefetch_worker,
-                args=(sentences, self._context_window, self._batch_size, prefetch_q),
-                daemon=True,
-            )
-            prefetch_t.start()
+            # Shuffle pair order via index permutation, then build a
+            # (possibly pinned) tensor for the whole epoch.  Slicing this
+            # tensor per batch is O(1) — no Python loops, no GIL pressure.
+            perm = np_rng.permutation(n_pairs)
+            ctx_epoch = torch.from_numpy(ctx_all[perm])
+            pos_epoch = torch.from_numpy(pos_all[perm])
+            if is_cuda:
+                ctx_epoch = ctx_epoch.pin_memory()
+                pos_epoch = pos_epoch.pin_memory()
+            self._phase(f"epoch {epoch} shuffle+pin done", t_ref)
 
-            while True:
-                item = prefetch_q.get()
-                if item is None:        # sentinel — epoch exhausted
-                    break
+            for b in range(n_batches):
+                start = b * self._batch_size
+                end = min(start + self._batch_size, n_pairs)
 
-                ctx_arr, pos_arr = item
-
-                # torch.from_numpy is near zero-copy (shares memory with the array).
-                # pin_memory() pages the buffer so DMA can copy without a staging copy.
-                # non_blocking=True lets the CPU return immediately after issuing the
-                # transfer; PyTorch syncs automatically before the tensor is used.
-                ctx_t = torch.from_numpy(ctx_arr)
-                pos_t = torch.from_numpy(pos_arr)
-                if use_pin:
-                    ctx_t = ctx_t.pin_memory()
-                    pos_t = pos_t.pin_memory()
-                ctx_t = ctx_t.to(device, non_blocking=True)
-                pos_t = pos_t.to(device, non_blocking=True)
+                ctx_t = ctx_epoch[start:end].to(device, non_blocking=True)
+                pos_t = pos_epoch[start:end].to(device, non_blocking=True)
 
                 # ---- debug: time first batch in detail ----------------------
-                if self._debug and n_batches == 0 and epoch == 1:
-                    self._phase(f"  first batch on device ({len(ctx_arr)} pairs)", t_ref)
-                    optimizer.zero_grad()
-                    logits, labels = model.score_with_negatives(ctx_t, pos_t, torch)
+                if self._debug and b == 0 and epoch == 1:
+                    self._phase(f"  first batch on device ({end - start} pairs)", t_ref)
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                        logits, labels = model.score_with_negatives(ctx_t, pos_t, torch)
+                        loss = bce(logits, labels)
                     self._phase("  first forward pass done", t_ref)
-                    loss = bce(logits, labels)
-                    loss.backward()
+                    scaler.scale(loss).backward()
                     self._phase("  first backward pass done", t_ref)
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
                     self._phase("  first optimizer step done", t_ref)
                     total_loss += loss.item()
-                    n_batches += 1
+                    train_batches_done += 1
                     continue
                 # -------------------------------------------------------------
 
-                optimizer.zero_grad()
-                logits, labels = model.score_with_negatives(ctx_t, pos_t, torch)
-                loss = bce(logits, labels)
-                loss.backward()
-                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                    logits, labels = model.score_with_negatives(ctx_t, pos_t, torch)
+                    loss = bce(logits, labels)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
                 total_loss += loss.item()
-                n_batches += 1
+                train_batches_done += 1
 
-            prefetch_t.join()
+                # ---- inline progress bar ------------------------------------
+                now = time.monotonic()
+                if verbose and (
+                    now - last_progress_t >= _PROGRESS_INTERVAL
+                    or b == n_batches - 1
+                ):
+                    last_progress_t = now
+                    done = b + 1
+                    frac = done / n_batches
+                    bar_w = 20
+                    filled = int(bar_w * frac)
+                    bar = "\u2588" * filled + "\u2591" * (bar_w - filled)
+                    avg_loss = total_loss / done
+
+                    epoch_elapsed = now - t_epoch
+                    epoch_eta = epoch_elapsed / done * (n_batches - done)
+
+                    train_elapsed = now - t_train
+                    total_eta = (
+                        train_elapsed / train_batches_done
+                        * (total_train_batches - train_batches_done)
+                    )
+
+                    print(
+                        f"\r  Epoch {epoch}/{epochs}  |{bar}| "
+                        f"{done}/{n_batches}  "
+                        f"loss={avg_loss:.4f}  "
+                        f"ETA: {_format_eta(epoch_eta)}  "
+                        f"[total: {_format_eta(total_eta)}]",
+                        end="", flush=True,
+                    )
 
             elapsed = time.monotonic() - t_epoch
             if verbose:
                 avg_loss = total_loss / max(n_batches, 1)
                 pairs_per_sec = n_pairs / elapsed if elapsed > 0 else 0
+                # Overwrite the progress bar with the final epoch summary.
                 print(
-                    f"  Epoch {epoch}/{epochs}  loss={avg_loss:.4f}  "
+                    f"\r  Epoch {epoch}/{epochs}  loss={avg_loss:.4f}  "
                     f"time={elapsed:.1f}s  ({pairs_per_sec:,.0f} pairs/s)"
+                    + " " * 40
                 )
+
+        if verbose:
+            total_time = time.monotonic() - t_train
+            print(f"  Training complete in {_format_eta(total_time)}")

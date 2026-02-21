@@ -15,13 +15,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-train = ["torch>=2.0"]
-dev = ["pytest>=7.0", "torch>=2.0"]
+train = ["torch>=2.0", "tqdm>=4.0"]
+data  = ["boto3>=1.28"]
+dev   = ["pytest>=7.0", "torch>=2.0"]
 gui = ["PyQt6>=6.4"]
 
 [project.scripts]
 ai-t9-build-vocab = "ai_t9._scripts.build_vocab:main"
-ai-t9-train = "ai_t9._scripts.train:main"
+ai-t9-train       = "ai_t9._scripts.train:main"
+ai-t9-data        = "ai_t9._scripts.data:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

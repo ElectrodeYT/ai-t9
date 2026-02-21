@@ -429,6 +429,17 @@ class DualEncoderTrainer:
         if is_cuda and torch.cuda.is_available() and torch.cuda.get_device_properties(device).major >= 8:
             torch.set_float32_matmul_precision("high")
 
+        # Mixed precision: prefer BF16 (no GradScaler needed, same exponent range
+        # as float32); fall back to FP16 + GradScaler on pre-Ampere CUDA GPUs.
+        amp_dtype = None
+        scaler = None
+        if is_cuda:
+            if torch.cuda.is_bf16_supported():
+                amp_dtype = torch.bfloat16
+            else:
+                amp_dtype = torch.float16
+                scaler = torch.cuda.amp.GradScaler()
+
         vocab_size = self._vocab.size
         embed_dim = self._embed_dim
         neg_samples = self._neg_samples
@@ -511,11 +522,13 @@ class DualEncoderTrainer:
             else:
                 vram_str = f"data: {(ctx_dev.nbytes + pos_dev.nbytes) / 1e6:.0f} MB"
             compiled_str = "on" if compiled is not model else "off"
+            amp_str = str(amp_dtype).replace("torch.", "") if amp_dtype is not None else "fp32"
             print(
                 f"Device: {device}  |  training pairs: {n_pairs:,}  |  "
                 f"vocab: {vocab_size}  |  embed_dim: {embed_dim}  |  "
                 f"neg_samples: {neg_samples}  |  "
                 f"batch: {self._batch_size}  |  torch.compile: {compiled_str}  |  "
+                f"amp: {amp_str}  |  "
                 f"{vram_str}"
             )
 
@@ -542,10 +555,17 @@ class DualEncoderTrainer:
                 idx = perm[start:end]
 
                 optimizer.zero_grad(set_to_none=True)
-                logits, labels = compiled(ctx_dev[idx], pos_dev[idx])
-                loss = bce(logits, labels)
-                loss.backward()
-                optimizer.step()
+                with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                                    enabled=amp_dtype is not None):
+                    logits, labels = compiled(ctx_dev[idx], pos_dev[idx])
+                    loss = bce(logits, labels)
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
                 total_loss += loss.item()
                 if _tqdm is not None and verbose:

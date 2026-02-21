@@ -13,25 +13,32 @@ Training objective: candidate-only negative sampling
 GPU utilisation design
 -----------------------
 1. Pre-computed pairs — all (context, target) pairs are materialised as flat
-   NumPy arrays *once* before training.  Each epoch shuffles via a NumPy
-   permutation (which releases the GIL) and converts to a pinned-memory
-   tensor in one step.  Batches are then simple O(1) tensor slices — no
-   Python generator or per-batch array construction, eliminating the main
-   GIL-contention bottleneck that kept the GPU starved for data.
+   NumPy arrays *once* before training.  Each epoch shuffles a lightweight
+   index array in-place (no allocation); batches are gathered via small
+   fancy-index slices (~50 KB each) rather than copying the full dataset.
+   This eliminates GIL contention and the ~500 MB per-epoch copy+pin that
+   previously saturated the CPU.
 
 2. On-GPU negative sampling — torch.randint generates all negative IDs
    directly on the GPU; only (ctx_ids, pos_ids) are transferred from CPU,
    roughly 20× less data per batch than before.
 
-3. Pinned memory + non-blocking transfers (CUDA only) — the full shuffled
-   epoch tensor is pinned once; batch slices inherit the pinned status
-   and transfer via DMA without per-batch OS allocation overhead.
+3. Pinned memory + non-blocking transfers (CUDA only) — double-buffered
+   pre-allocated pinned tensors avoid per-batch cudaHostAlloc/Free OS calls;
+   batch data is DMA-transferred asynchronously.
 
-4. Automatic mixed precision (AMP) — on CUDA, forward passes run in float16
-   via torch.amp.autocast, roughly doubling throughput for embedding lookups
-   and matrix operations.  A GradScaler prevents float16 gradient underflow.
+4. Automatic mixed precision (AMP) — on CUDA, forward passes run under
+   torch.amp.autocast, casting torch.bmm to float16.  GradScaler is
+   intentionally omitted because this model produces no float16 gradients
+   (only bmm is autocasted; everything else stays float32), and removing it
+   eliminates a per-batch CPU↔GPU sync caused by its internal .item() call
+   (CUDA defaults to spin-wait synchronisation, which pins a CPU core).
 
-5. TF32 matmul (Ampere+ GPUs) — float32 matrix multiplications use
+5. GPU-side loss accumulation — training loss is accumulated in a device
+   tensor and only transferred to CPU for progress-bar redraws (~4×/s),
+   avoiding ~1000 per-batch spin-wait sync points per second.
+
+6. TF32 matmul (Ampere+ GPUs) — float32 matrix multiplications use
    TensorFloat-32 for ~3× speed at effectively no accuracy cost.
 """
 
@@ -383,22 +390,43 @@ class DualEncoderTrainer:
         self._phase("optimizer ready", t_ref)
 
         # ---- Phase 4: pre-compute all training pairs as flat arrays ----------
-        # Done once; per-epoch shuffling uses numpy permutation (releases GIL).
+        # Done once; per-epoch shuffling uses a lightweight index permutation
+        # and pairs are gathered per-batch (only ~50 KB each), avoiding the
+        # ~500 MB full-array copy + pin that previously pinned the CPU at 100%.
         ctx_all, pos_all = _precompute_pairs(sentences, self._context_window)
         n_pairs = len(pos_all)
         n_batches = math.ceil(n_pairs / self._batch_size)
         self._phase(f"pairs pre-computed ({n_pairs:,} pairs)", t_ref)
 
-        # AMP (automatic mixed precision) — CUDA only.  The GradScaler acts as
-        # a no-op when enabled=False, so no if/else branches are needed below.
+        # AMP autocast (CUDA only).  Under autocast only torch.bmm is cast to
+        # float16; everything else (embedding lookup, normalize, element-wise
+        # ops, BCE loss) stays float32.  Because no float16 gradients are
+        # produced, GradScaler is unnecessary — and removing it eliminates the
+        # per-batch CPU↔GPU sync from its internal found_inf.item() call
+        # (CUDA uses spin-wait synchronisation by default, which pins a CPU
+        # core at 100 % for every sync point).
         is_cuda = str(device).startswith("cuda")
         use_amp = is_cuda
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
         # TF32 matmul on Ampere+ GPUs (~3× faster float32 ops, negligible
         # accuracy difference for embedding training).
         if is_cuda and hasattr(torch, "set_float32_matmul_precision"):
             torch.set_float32_matmul_precision("high")
+
+        # Pre-allocate double-buffered pinned transfer buffers (CUDA only).
+        # Avoids ~2×n_batches cudaHostAlloc/Free OS calls per epoch.
+        # Double-buffering ensures the DMA from buffer A is finished before
+        # we overwrite it (an entire forward+backward pass intervenes).
+        if is_cuda:
+            _pin_ctx = tuple(
+                torch.empty(self._batch_size, self._context_window,
+                            dtype=torch.int64).pin_memory()
+                for _ in range(2)
+            )
+            _pin_pos = tuple(
+                torch.empty(self._batch_size, dtype=torch.int64).pin_memory()
+                for _ in range(2)
+            )
 
         if verbose:
             print(
@@ -407,6 +435,13 @@ class DualEncoderTrainer:
                 f"neg_samples: {self._neg_samples} (on GPU)  |  "
                 f"batch: {self._batch_size}  |  AMP: {'on' if use_amp else 'off'}"
             )
+
+        # Reusable index array — shuffled in-place each epoch (no allocation).
+        perm = np.arange(n_pairs, dtype=np.int64)
+
+        # GPU-side loss accumulator — avoids per-batch CPU↔GPU sync from
+        # .item().  Only synced to CPU for progress-bar redraws (~4×/s).
+        loss_accum = torch.zeros((), device=device)
 
         # ---- Training epochs ------------------------------------------------
         total_train_batches = n_batches * epochs
@@ -417,40 +452,50 @@ class DualEncoderTrainer:
 
         for epoch in range(1, epochs + 1):
             t_epoch = time.monotonic()
-            total_loss = 0.0
+            loss_accum.zero_()
 
-            # Shuffle pair order via index permutation, then build a
-            # (possibly pinned) tensor for the whole epoch.  Slicing this
-            # tensor per batch is O(1) — no Python loops, no GIL pressure.
-            perm = np_rng.permutation(n_pairs)
-            ctx_epoch = torch.from_numpy(ctx_all[perm])
-            pos_epoch = torch.from_numpy(pos_all[perm])
-            if is_cuda:
-                ctx_epoch = ctx_epoch.pin_memory()
-                pos_epoch = pos_epoch.pin_memory()
-            self._phase(f"epoch {epoch} shuffle+pin done", t_ref)
+            # In-place shuffle of index array — O(n) with no allocation,
+            # and NumPy releases the GIL during the shuffle.
+            np_rng.shuffle(perm)
+            self._phase(f"epoch {epoch} shuffle done", t_ref)
 
             for b in range(n_batches):
                 start = b * self._batch_size
                 end = min(start + self._batch_size, n_pairs)
+                idx = perm[start:end]               # O(1) view into perm
+                batch_len = end - start
 
-                ctx_t = ctx_epoch[start:end].to(device, non_blocking=True)
-                pos_t = pos_epoch[start:end].to(device, non_blocking=True)
+                # Copy into pre-pinned double-buffer, then async-DMA to GPU.
+                # No per-batch cudaHostAlloc, no per-batch .item() sync.
+                if is_cuda:
+                    buf_i = b & 1
+                    _pin_ctx[buf_i][:batch_len].copy_(
+                        torch.from_numpy(ctx_all[idx]))
+                    _pin_pos[buf_i][:batch_len].copy_(
+                        torch.from_numpy(pos_all[idx]))
+                    ctx_t = _pin_ctx[buf_i][:batch_len].to(
+                        device, non_blocking=True)
+                    pos_t = _pin_pos[buf_i][:batch_len].to(
+                        device, non_blocking=True)
+                else:
+                    ctx_t = torch.from_numpy(
+                        np.ascontiguousarray(ctx_all[idx])).to(device)
+                    pos_t = torch.from_numpy(
+                        np.ascontiguousarray(pos_all[idx])).to(device)
 
                 # ---- debug: time first batch in detail ----------------------
                 if self._debug and b == 0 and epoch == 1:
-                    self._phase(f"  first batch on device ({end - start} pairs)", t_ref)
+                    self._phase(f"  first batch on device ({batch_len} pairs)", t_ref)
                     optimizer.zero_grad(set_to_none=True)
                     with torch.amp.autocast(device_type="cuda", enabled=use_amp):
                         logits, labels = model.score_with_negatives(ctx_t, pos_t, torch)
                         loss = bce(logits, labels)
                     self._phase("  first forward pass done", t_ref)
-                    scaler.scale(loss).backward()
+                    loss.backward()
                     self._phase("  first backward pass done", t_ref)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    optimizer.step()
                     self._phase("  first optimizer step done", t_ref)
-                    total_loss += loss.item()
+                    loss_accum += loss.detach()
                     train_batches_done += 1
                     continue
                 # -------------------------------------------------------------
@@ -459,11 +504,10 @@ class DualEncoderTrainer:
                 with torch.amp.autocast(device_type="cuda", enabled=use_amp):
                     logits, labels = model.score_with_negatives(ctx_t, pos_t, torch)
                     loss = bce(logits, labels)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                loss.backward()
+                optimizer.step()
 
-                total_loss += loss.item()
+                loss_accum += loss.detach()
                 train_batches_done += 1
 
                 # ---- inline progress bar ------------------------------------
@@ -478,7 +522,7 @@ class DualEncoderTrainer:
                     bar_w = 20
                     filled = int(bar_w * frac)
                     bar = "\u2588" * filled + "\u2591" * (bar_w - filled)
-                    avg_loss = total_loss / done
+                    avg_loss = loss_accum.item() / done  # only sync point
 
                     epoch_elapsed = now - t_epoch
                     epoch_eta = epoch_elapsed / done * (n_batches - done)
@@ -501,6 +545,7 @@ class DualEncoderTrainer:
 
             elapsed = time.monotonic() - t_epoch
             if verbose:
+                total_loss = loss_accum.item()
                 avg_loss = total_loss / max(n_batches, 1)
                 pairs_per_sec = n_pairs / elapsed if elapsed > 0 else 0
                 # Overwrite the progress bar with the final epoch summary.

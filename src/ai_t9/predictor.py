@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -204,6 +205,8 @@ class T9Predictor:
             final           – final blended score array
             order           – argsort indices (descending) used for ranking
             weights         – effective weights dict
+            timing_ms       – wall-clock ms for each pipeline stage;
+                              keys: "dict", "freq", "model", "ngram", "blend", "total"
         """
         if not is_valid_digit_sequence(digit_seq):
             raise ValueError(
@@ -211,7 +214,13 @@ class T9Predictor:
                 "Use digits 2-9 only (T9 keypad)."
             )
 
+        _t0 = time.perf_counter_ns()
+
+        # ── Stage 1: dict lookup ──────────────────────────────────────
+        _td0 = time.perf_counter_ns()
         candidates = self._dict.lookup(digit_seq)
+        _td1 = time.perf_counter_ns()
+
         if not candidates:
             empty_trace: dict = {
                 "digit_seq": digit_seq,
@@ -227,17 +236,27 @@ class T9Predictor:
                 "final": np.array([], dtype=np.float32),
                 "order": np.array([], dtype=np.intp),
                 "weights": self.weights,
+                "timing_ms": {
+                    "dict": (_td1 - _td0) / 1e6,
+                    "freq": 0.0, "model": 0.0, "ngram": 0.0, "blend": 0.0,
+                    "total": (time.perf_counter_ns() - _t0) / 1e6,
+                },
             }
             return [], empty_trace
 
         words, word_ids = zip(*candidates)
         word_ids_list = list(word_ids)
 
+        # ── Stage 2: frequency scoring ────────────────────────────────
+        _tf0 = time.perf_counter_ns()
         freq_raw = np.array(
             [self._vocab.logfreq(wid) for wid in word_ids_list], dtype=np.float32
         )
         freq_norm = _normalise(freq_raw)
+        _tf1 = time.perf_counter_ns()
 
+        # ── Stage 3: model scoring ────────────────────────────────────
+        _tm0 = time.perf_counter_ns()
         if self._model is not None and self._wm > 0:
             ctx_ids = self._vocab.words_to_ids(list(context))
             model_raw = self._model.score_candidates(ctx_ids, word_ids_list)
@@ -245,7 +264,10 @@ class T9Predictor:
         else:
             model_raw = None
             model_norm = None
+        _tm1 = time.perf_counter_ns()
 
+        # ── Stage 4: ngram scoring ────────────────────────────────────
+        _tn0 = time.perf_counter_ns()
         if self._ngram is not None and self._wn > 0 and context:
             prev_id = self._vocab.word_to_id(context[-1].lower())
             ngram_raw = np.array(
@@ -255,7 +277,10 @@ class T9Predictor:
         else:
             ngram_raw = None
             ngram_norm = None
+        _tn1 = time.perf_counter_ns()
 
+        # ── Stage 5: blend + sort ─────────────────────────────────────
+        _tb0 = time.perf_counter_ns()
         mn = model_norm if model_norm is not None else np.zeros(len(word_ids_list), dtype=np.float32)
         nn = ngram_norm if ngram_norm is not None else np.zeros(len(word_ids_list), dtype=np.float32)
 
@@ -274,6 +299,8 @@ class T9Predictor:
             )
             for i in top_indices
         ]
+        _tb1 = time.perf_counter_ns()
+        _t1  = time.perf_counter_ns()
 
         trace: dict = {
             "digit_seq": digit_seq,
@@ -289,6 +316,14 @@ class T9Predictor:
             "final": final,
             "order": order,
             "weights": self.weights,
+            "timing_ms": {
+                "dict":  (_td1 - _td0) / 1e6,
+                "freq":  (_tf1 - _tf0) / 1e6,
+                "model": (_tm1 - _tm0) / 1e6,
+                "ngram": (_tn1 - _tn0) / 1e6,
+                "blend": (_tb1 - _tb0) / 1e6,
+                "total": (_t1  - _t0)  / 1e6,
+            },
         }
 
         return ranked, trace

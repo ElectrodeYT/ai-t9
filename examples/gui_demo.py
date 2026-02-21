@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import deque
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QGuiApplication, QKeySequence, QPalette, QShortcut
@@ -423,20 +424,24 @@ class ContextStrip(QWidget):
 class DebugWindow(QWidget):
     """Live predictor debug panel — non-modal, stays open alongside the phone.
 
-    Four tabs:
+    Six tabs:
     • Scores    — per-candidate score table with visual bars for every signal
     • Pipeline  — step-by-step trace: dict lookup → freq → model → ngram → blend
     • Config    — predictor weights, vocabulary size, active signals
     • Log       — rolling history of digit sequences and confirmed words
+    • Perf      — per-call latency breakdown with running stats (last 50 predictions)
+    • Help      — guide to reading this window and interpreting every signal
     """
 
-    _MAX_LOG = 200  # lines
+    _MAX_LOG  = 200  # lines
+    _MAX_PERF = 50   # prediction calls to keep in perf history
 
     def __init__(self, predictor, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._predictor = predictor
         self._log_lines: list[str] = []
         self._last_trace: dict | None = None
+        self._perf_history: deque = deque(maxlen=self._MAX_PERF)
 
         self.setWindowTitle("ai-t9 — Predictor Debug")
         self.setMinimumSize(660, 520)
@@ -528,8 +533,28 @@ class DebugWindow(QWidget):
         log_lay.addWidget(self._log_browser)
         self._tabs.addTab(log_w, "📜  Log")
 
-        # Populate config tab once (static)
+        # ── Tab 5: Perf ──────────────────────────────────────────────────
+        perf_w = QWidget()
+        perf_lay = QVBoxLayout(perf_w)
+        perf_lay.setContentsMargins(6, 6, 6, 6)
+        self._perf_browser = QTextBrowser()
+        self._perf_browser.setOpenLinks(False)
+        perf_lay.addWidget(self._perf_browser)
+        self._tabs.addTab(perf_w, "⏱  Perf")
+
+        # ── Tab 6: Help ─────────────────────────────────────────────────
+        help_w = QWidget()
+        help_lay = QVBoxLayout(help_w)
+        help_lay.setContentsMargins(6, 6, 6, 6)
+        self._help_browser = QTextBrowser()
+        self._help_browser.setOpenLinks(False)
+        help_lay.addWidget(self._help_browser)
+        self._tabs.addTab(help_w, "❓  Help")
+
+        # Populate static tabs once
         self._render_config()
+        self._render_perf()
+        self._render_help()
 
     # ── Public update entry point ──────────────────────────────────────
 
@@ -543,8 +568,11 @@ class DebugWindow(QWidget):
     ) -> None:
         """Called by T9PhoneWindow._refresh() whenever state changes."""
         self._last_trace = trace
+        if trace and "timing_ms" in trace:
+            self._perf_history.append(trace["timing_ms"])
         self._render_scores(trace)
         self._render_pipeline(trace, context, mode, digit_buf, committed)
+        self._render_perf()
 
     def append_log(self, entry: str) -> None:
         self._log_lines.append(entry)
@@ -842,6 +870,293 @@ class DebugWindow(QWidget):
     def _clear_log(self) -> None:
         self._log_lines.clear()
         self._render_log()
+
+    def _render_perf(self) -> None:
+        """Render the Perf tab: running stats + per-call latency table."""
+        lines: list[str] = []
+
+        def _h(title: str, color: str = C["display_active"]) -> str:
+            return (
+                f'<span style="color:{color};font-weight:bold;font-size:13px">'
+                f'\u2500\u2500 {title} \u2500\u2500</span>'
+            )
+
+        def _kv(k: str, v: str, vc: str = "#c8ccd8") -> str:
+            return (
+                f'<span style="color:{C["status_text"]}">{k}:</span>&nbsp;'
+                f'<span style="color:{vc}">{v}</span>'
+            )
+
+        def _bar_html(frac: float, color: str, width: int = 100) -> str:
+            px = max(2, int(min(frac, 1.0) * width))
+            return (
+                f'<span style="display:inline-block;background:{color};'
+                f'width:{px}px;height:7px;"></span>'
+            )
+
+        hist = list(self._perf_history)
+        if not hist:
+            lines.append(_h("No predictions recorded yet"))
+            lines.append('<span style="color:#565a6e">Type digits 2\u20139 to run a prediction.</span>')
+            self._perf_browser.setHtml(self._wrap_html("<br>".join(lines)))
+            return
+
+        totals = [h["total"] for h in hist]
+        n = len(totals)
+        min_ms  = min(totals)
+        max_ms  = max(totals)
+        mean_ms = sum(totals) / n
+        last_ms = totals[-1]
+
+        lines.append(_h("Call statistics"))
+        lines.append(_kv("calls recorded", str(n), C["cand_text"]))
+        lat_col = (
+            "#44aa77" if last_ms < 5
+            else "#cc8844" if last_ms < 20
+            else "#cc4444"
+        )
+        lines.append(_kv("last",  f"{last_ms:.2f} ms", lat_col))
+        lines.append(_kv("mean",  f"{mean_ms:.2f} ms", "#c8ccd8"))
+        lines.append(_kv("min",   f"{min_ms:.2f} ms",  "#44aa77"))
+        lines.append(_kv("max",   f"{max_ms:.2f} ms",
+                         "#44aa77" if max_ms < 10 else "#cc8844"))
+        lines.append("")
+
+        STAGES = [
+            ("dict",  "dict",   "#4488cc"),
+            ("freq",  "freq",   "#6688aa"),
+            ("model", "model",  "#cc8844"),
+            ("ngram", "ngram",  "#44aa77"),
+            ("blend", "blend",  "#888888"),
+        ]
+
+        lines.append(_h("Avg stage breakdown", "#9898b8"))
+        lines.append("<table cellpadding='2' cellspacing='0'>")
+        for key, label, color in STAGES:
+            vals = [h.get(key, 0.0) for h in hist]
+            avg  = sum(vals) / n
+            frac = avg / mean_ms if mean_ms > 0 else 0.0
+            lines.append(
+                f"<tr>"
+                f'<td style="color:{C["status_text"]};width:45px">{label}</td>'
+                f'<td style="color:{color};width:58px;text-align:right">{avg:.3f} ms</td>'
+                f'<td style="padding-left:6px">{_bar_html(frac, color)}</td>'
+                f'<td style="color:#555;padding-left:4px">{frac*100:.0f}%</td>'
+                f"</tr>"
+            )
+        lines.append("</table>")
+        lines.append("")
+
+        # Per-call history (most recent first, up to 30 rows)
+        recent = hist[-30:][::-1]
+        lines.append(_h("Recent calls  (ms)", "#665555"))
+        lines.append("<table cellpadding='1' cellspacing='0' style='font-size:11px'>")
+        hdr = (
+            f'<td style="color:#444;padding:0 5px">#</td>'
+            + "".join(
+                f'<td style="color:{color};padding:0 5px">{label}</td>'
+                for _, label, color in STAGES
+            )
+            + f'<td style="color:#c8ccd8;padding:0 5px">total</td>'
+        )
+        lines.append(f"<tr>{hdr}</tr>")
+        for idx, h in enumerate(recent):
+            call_no = n - idx
+            row = f'<td style="color:#444;padding:0 5px">{call_no}</td>'
+            for key, _, color in STAGES:
+                v = h.get(key, 0.0)
+                row += (
+                    f'<td style="color:{color};text-align:right;padding:0 5px">'
+                    f'{v:.2f}</td>'
+                )
+            row += (
+                f'<td style="color:#c8ccd8;text-align:right;padding:0 5px">'
+                f'{h["total"]:.2f}</td>'
+            )
+            lines.append(f"<tr>{row}</tr>")
+        lines.append("</table>")
+
+        self._perf_browser.setHtml(self._wrap_html("<br>".join(lines)))
+
+    def _render_help(self) -> None:
+        """Populate the Help tab with a static guide to the debug window."""
+        TEAL   = C["display_active"]
+        BLUE   = "#4488cc"
+        ORANGE = "#cc8844"
+        GREEN  = "#44aa77"
+        DIM    = C["status_text"]
+        TXT    = "#c8ccd8"
+
+        def _h(t: str, color: str = TEAL) -> str:
+            return (
+                f'<p style="color:{color};font-weight:bold;'
+                f'margin:10px 0 2px 0;font-size:13px">{t}</p>'
+            )
+
+        def _p(t: str) -> str:
+            return f'<p style="color:{TXT};margin:2px 0 4px 0">{t}</p>'
+
+        def _bullets(items: list[tuple[str, str, str]]) -> str:
+            rows = "".join(
+                f'<li><b style="color:{c}">{label}:</b>&nbsp;'
+                f'<span style="color:{TXT}">{body}</span></li>'
+                for label, body, c in items
+            )
+            return f'<ul style="margin:2px 0;padding-left:18px">{rows}</ul>'
+
+        sections: list[str] = []
+
+        sections.append(_h("Overview"))
+        sections.append(_p(
+            "Every time you type a digit sequence, the predictor runs a 4-stage "
+            "pipeline. This window exposes every intermediate value so you can "
+            "diagnose reranking behaviour, verify loaded artifacts, and measure latency."
+        ))
+
+        sections.append(_h("\U0001f4ca Scores tab", BLUE))
+        sections.append(_p("One row per candidate word. Columns:"))
+        sections.append(_bullets([
+            ("freq (raw)",
+             "Log-probability of the word in the training corpus. "
+             "Higher (less negative) = more common. "
+             "All values are negative because log(p) &lt; 0 for any p &lt; 1.",
+             BLUE),
+            ("freq \u25aa",
+             "Rank-normalised freq score in [0, 1]. Only relative order matters "
+             "after normalisation.",
+             BLUE),
+            ("model \u25aa",
+             "Rank-normalised cosine similarity between the context embedding "
+             "and this word\u2019s embedding. Shows n/a when no model is loaded.",
+             ORANGE),
+            ("ngram \u25aa",
+             "Rank-normalised bigram log-probability given the immediately "
+             "preceding confirmed word. Shows n/a when no ngram model is loaded "
+             "or no prior context exists yet.",
+             GREEN),
+            ("final \u25aa",
+             "Weighted blend: w_freq\u00b7freq + w_model\u00b7model + w_ngram\u00b7ngram. "
+             "Higher = ranked first in the candidate bar.",
+             TEAL),
+        ]))
+
+        sections.append(_h("\U0001f52c Pipeline tab", ORANGE))
+        sections.append(_p("Step-by-step trace of the most recent prediction:"))
+        sections.append(_bullets([
+            ("Stage 1 \u00b7 dict",
+             "T9 digit sequence \u2192 candidate words via the pre-built hash map. "
+             "Candidates are pre-sorted by descending log-frequency, so even "
+             "before scoring the order is meaningful.",
+             DIM),
+            ("Stage 2 \u00b7 freq",
+             "Log-frequency from the vocabulary. Always active. Acts as the "
+             "sole tiebreaker when model and ngram are both absent or zero-weighted.",
+             BLUE),
+            ("Stage 3 \u00b7 model",
+             "Context-aware reranking via the dual-encoder. The context vector is "
+             "the mean embedding of recently confirmed words. Scores are cosine "
+             "similarities. Disabled until context exists or if no model is loaded.",
+             ORANGE),
+            ("Stage 4 \u00b7 ngram",
+             "Bigram language model (add-k smoothed). Uses only the single "
+             "immediately preceding word. Disabled until at least one word has "
+             "been confirmed, or when no ngram file is loaded.",
+             GREEN),
+            ("Stage 5 \u00b7 blend",
+             "Weighted sum of rank-normalised signals. Inactive signals contribute 0; "
+             "remaining weights are auto-renormalised so they always sum to 1.",
+             TEAL),
+        ]))
+
+        sections.append(_h("\u2699 Config tab", DIM))
+        sections.append(_p(
+            "Displays loaded artifact details and effective signal weights after renormalisation. "
+            "A weight of 0 means that signal is disabled (either not loaded or set to zero "
+            "in the T9Predictor constructor). Weights can only be changed in code via "
+            "<code>T9Predictor(freq_weight=\u2026)</code>."
+        ))
+
+        sections.append(_h("\u23f1 Perf tab", "#9898b8"))
+        sections.append(_p(
+            "Per-call latency breakdown recorded for the last "
+            + str(self._MAX_PERF)
+            + " predictions. All times are wall-clock milliseconds measured with "
+            "<code>time.perf_counter_ns()</code>."
+        ))
+        sections.append(_bullets([
+            ("dict",
+             "Time to look up candidates in the T9 hash map. "
+             "Should be &lt;0.1\u2009ms for any normal-sized dictionary.",
+             BLUE),
+            ("freq",
+             "Time to build the log-frequency array + rank-normalise. O(n) in number of candidates.",
+             BLUE),
+            ("model",
+             "Context embedding lookup + batch dot-product scoring. "
+             "Typically 0\u20132\u2009ms on CPU for embed_dim \u2264 300. "
+             "Zero when the model signal is disabled.",
+             ORANGE),
+            ("ngram",
+             "Sparse CSR row-slice + binary search over candidates. "
+             "Near-instant. Zero when the ngram signal is disabled.",
+             GREEN),
+            ("blend",
+             "Weighted sum + argsort. O(n log n) but n is small so near-instant.",
+             DIM),
+            ("total",
+             "Full wall-clock time from start to end of predict_with_trace(), "
+             "including all Python overhead.",
+             TEAL),
+        ]))
+        sections.append(_p(
+            "<b>Latency targets:</b> &lt;5\u2009ms is excellent for real-time typing. "
+            "5\u201320\u2009ms is acceptable on most devices. &gt;20\u2009ms may feel sluggish. "
+            "If model scoring dominates, try reducing <code>embed_dim</code> or switching to "
+            "<code>CharNgramDualEncoder</code> (smaller embedding matrix for the same capacity)."
+        ))
+
+        sections.append(_h("Rank normalisation"))
+        sections.append(_p(
+            "Before blending, each raw signal array is converted to fractional ranks:"
+        ))
+        sections.append(_p(
+            "&nbsp;&nbsp;&nbsp;&nbsp;"
+            "rank_score(i) = rank_of(score_i) / (n \u2212 1)"
+        ))
+        sections.append(_p(
+            "Only relative ordering matters \u2014 raw log-probabilities and cosine "
+            "similarities from very different distributions combine fairly. "
+            "A fractional rank of 1.0 = highest scorer for that signal; 0.0 = lowest. "
+            "Ties receive averaged ranks."
+        ))
+
+        sections.append(_h("Quick diagnostics"))
+        sections.append(_bullets([
+            ("Signal shows n/a",
+             "The artifact was not loaded (check --model / --ngram flags) "
+             "or the signal has weight 0.",
+             DIM),
+            ("Wrong word ranked first",
+             "Open Pipeline, compare Stage 3 and 4 values for the wrong vs expected "
+             "candidate. If a signal is actively hurting ranking, lower its weight.",
+             DIM),
+            ("Prediction feels slow",
+             "Open Perf and identify the dominant stage. "
+             "If model dominates, try a smaller embed_dim. "
+             "If dict dominates, the dictionary may be unusually large.",
+             DIM),
+            ("Expected word never appears",
+             "It is absent from the T9 dictionary for that digit sequence \u2014 "
+             "either missing from vocab or excluded by a restricted --dictionary wordlist.",
+             DIM),
+        ]))
+
+        html = (
+            '<html><body style="background:{bg};color:{txt};'
+            'font-family:\'Courier New\',monospace;font-size:12px;padding:6px">'
+            '{body}</body></html>'
+        ).format(bg=C["phone_bg"], txt=TXT, body="".join(sections))
+        self._help_browser.setHtml(html)
 
     # ── Helpers ────────────────────────────────────────────────────────
 

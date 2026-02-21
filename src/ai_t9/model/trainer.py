@@ -681,14 +681,19 @@ class DualEncoderTrainer:
             n_batches = n_pairs // self._batch_size
 
         if verbose:
-            vram_mb = (ctx_dev.nbytes + pos_dev.nbytes) / 1e6
+            if is_cuda:
+                vram_alloc_mb = torch.cuda.memory_allocated(device) / 1e6
+                vram_total_mb = torch.cuda.get_device_properties(device).total_memory / 1e6
+                vram_str = f"VRAM: {vram_alloc_mb:.0f} / {vram_total_mb:.0f} MB"
+            else:
+                vram_str = f"data: {(ctx_dev.nbytes + pos_dev.nbytes) / 1e6:.0f} MB"
             print(
                 f"Device: {device}  |  training pairs: {n_pairs:,}  |  "
                 f"vocab: {vocab_size}  |  embed_dim: {self._embed_dim}  |  "
                 f"neg_samples: {self._neg_samples} (on GPU)  |  "
                 f"batch: {self._batch_size}  |  AMP: {'on' if use_amp else 'off'}  |  "
                 f"CUDA graph: {'on' if graph else 'off'}  |  "
-                f"data VRAM: {vram_mb:.0f} MB"
+                f"{vram_str}"
             )
 
         # GPU-side loss accumulator.
@@ -705,8 +710,13 @@ class DualEncoderTrainer:
             t_epoch = time.monotonic()
             loss_accum.zero_()
 
-            # On-device shuffle via randperm — no CPU work at all.
-            perm = torch.randperm(n_pairs, device=device)
+            # Generate permutation on CPU then transfer to device.
+            # CUDA's randperm implementation needs ~2× the output size in
+            # temporary workspace; for large pair counts this can exhaust
+            # VRAM.  CPU randperm + .to(device) avoids the temp allocation
+            # and the H2D copy only takes ~0.1–0.3 s for tens of millions
+            # of indices.
+            perm = torch.randperm(n_pairs).to(device, non_blocking=True)
             self._phase(f"epoch {epoch} shuffle done", t_ref)
 
             for b in range(n_batches):

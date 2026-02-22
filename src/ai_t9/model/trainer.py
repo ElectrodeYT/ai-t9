@@ -75,6 +75,54 @@ def _resolve_device(torch, preference: str) -> "torch.device":
     return torch.device("cpu")
 
 
+def _auto_batch_size(torch, device) -> int:
+    """Pick the largest power-of-2 batch size whose (B,B) logits fit in VRAM.
+
+    The dominant memory consumer for in-batch negative training is the
+    (B, B) logits matrix and its gradients.  This function allocates ~50%
+    of available GPU memory for that matrix, leaving room for model
+    parameters, optimizer state, and training data.
+
+    Falls back to 2048 on non-CUDA devices.
+    """
+    if not (str(device).startswith("cuda") and torch.cuda.is_available()):
+        return 2048
+
+    try:
+        free, _total = torch.cuda.mem_get_info(device)
+    except AttributeError:
+        free = torch.cuda.get_device_properties(device).total_memory
+
+    # Budget ~50% of free VRAM for the logits matrix + gradients.
+    # Remaining goes to model params, optimizer state, data, CUDA overhead.
+    # I genuinely do not know the best value for this, or if it is even possible to 
+    # calculate this rather than just having to test it.
+    logit_budget = int(free * 0.016)
+
+    # During forward + backward the logits matrix occupies:
+    #   (B, B) in AMP dtype (~2 bytes) + gradient (~2 bytes)
+    #   + cross-entropy softmax intermediates (~4 bytes float32)
+    #   ≈ 8 bytes per element total.
+    max_b = int(math.sqrt(logit_budget / 8))
+
+    if max_b < 2048:
+        return 2048
+    batch_size = 1 << int(math.log2(max_b))
+    return min(batch_size, 131072)
+
+
+def _resolve_batch_size(
+    batch_size: int, torch, device, verbose: bool = False,
+) -> int:
+    """Return *batch_size* unchanged if positive, otherwise auto-detect."""
+    if batch_size > 0:
+        return batch_size
+    auto = _auto_batch_size(torch, device)
+    if verbose:
+        print(f"  Auto batch size: {auto:,}")
+    return auto
+
+
 # ---------------------------------------------------------------------------
 # Corpus iterator helpers
 # ---------------------------------------------------------------------------
@@ -133,37 +181,71 @@ def _precompute_pairs(
     useful and waste gradient signal.  (UNK tokens should already be stripped
     from sentences by the corpus loaders, but this is a safety net.)
 
+    Uses vectorised NumPy operations per sentence (stride-trick context
+    windows + boolean masking) instead of element-by-element Python writes.
+
     Returns:
         ctx_arr: int64 (n_pairs, context_window) — zero-padded on the left
         pos_arr: int64 (n_pairs,)
     """
     _UNK = 0
-    n_pairs = sum(max(0, len(s) - 1) for s in sentences)
-    ctx_arr = np.zeros((n_pairs, context_window), dtype=np.int64)
-    pos_arr = np.empty(n_pairs, dtype=np.int64)
     if verbose:
         print("Precomputing training pairs...")
-        progress_interval = max(1, n_pairs // 100)  # update every ~1%
-    idx = 0
-    for sent in sentences:
-        for t in range(1, len(sent)):
-            if sent[t] == _UNK:
-                continue  # skip UNK targets
-            ctx_start = max(0, t - context_window)
-            src = sent[ctx_start:t]
-            ctx_arr[idx, context_window - len(src):] = src
-            pos_arr[idx] = sent[t]
-            idx += 1
-            if verbose and idx % progress_interval == 0:
-                frac = idx / n_pairs
-                bar_w = 20
-                filled = int(bar_w * frac)
-                bar = "\u2588" * filled + "\u2591" * (bar_w - filled)
-                print(f"\r  |{bar}| {idx}/{n_pairs} pairs", end="", flush=True)
+
+    ctx_chunks: list[np.ndarray] = []
+    pos_chunks: list[np.ndarray] = []
+    total_pairs = 0
+    n_sents = len(sentences)
+    report_interval = max(1, n_sents // 100)
+
+    for si, sent in enumerate(sentences):
+        n = len(sent)
+        if n < 2:
+            continue
+        arr = np.array(sent, dtype=np.int64)
+
+        # Boolean mask: which targets (positions 1..n-1) are non-UNK?
+        targets = arr[1:]
+        mask = targets != _UNK
+        if not mask.any():
+            continue
+
+        # Prepend context_window zeros so that early positions get left-padding,
+        # then use a strided view to extract all context windows at once.
+        padded = np.empty(context_window + n, dtype=np.int64)
+        padded[:context_window] = 0
+        padded[context_window:] = arr
+
+        # windows[t] == padded[t : t + context_window] — left-padded context
+        # for the target at sentence index t.
+        strides = (padded.strides[0], padded.strides[0])
+        windows = np.lib.stride_tricks.as_strided(
+            padded, shape=(n, context_window), strides=strides,
+        )
+
+        # Select only valid (non-UNK target) rows.  Fancy indexing copies
+        # data, which also safely detaches from the strided view.
+        valid_t = np.where(mask)[0] + 1  # target positions in arr
+        ctx_chunks.append(windows[valid_t].copy())
+        pos_chunks.append(arr[valid_t])
+        total_pairs += len(valid_t)
+
+        if verbose and si % report_interval == 0:
+            frac = (si + 1) / n_sents
+            bar_w = 20
+            filled = int(bar_w * frac)
+            bar = "\u2588" * filled + "\u2591" * (bar_w - filled)
+            print(
+                f"\r  |{bar}| {si + 1}/{n_sents} sentences ({total_pairs:,} pairs)",
+                end="", flush=True,
+            )
+
     if verbose:
-        print()  # newline after progress bar
-    # Truncate to actual count (idx < n_pairs when UNK targets were skipped)
-    return ctx_arr[:idx], pos_arr[:idx]
+        print(f"\r  {total_pairs:,} pairs from {n_sents:,} sentences" + " " * 30)
+
+    if ctx_chunks:
+        return np.concatenate(ctx_chunks), np.concatenate(pos_chunks)
+    return np.zeros((0, context_window), dtype=np.int64), np.zeros(0, dtype=np.int64)
 
 
 def save_pairs(
@@ -332,7 +414,7 @@ class DualEncoderTrainer:
         warmup_frac: float = 0.05,
         min_lr_frac: float = 0.01,
         temperature: float = 0.07,
-        batch_size: int = 2048,
+        batch_size: int = 0,
         accumulate_grad_batches: int = 1,
         clip_grad_norm: float = 1.0,
         seed: int = 42,
@@ -473,6 +555,8 @@ class DualEncoderTrainer:
 
         if is_cuda and torch.cuda.is_available() and torch.cuda.get_device_properties(device).major >= 8:
             torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
         amp_dtype = None
         scaler = None
@@ -482,6 +566,10 @@ class DualEncoderTrainer:
             else:
                 amp_dtype = torch.float16
                 scaler = torch.cuda.amp.GradScaler()
+
+        self._batch_size = _resolve_batch_size(
+            self._batch_size, torch, device, verbose=verbose,
+        )
 
         vocab_size = self._vocab.size
         embed_dim = self._embed_dim
@@ -508,7 +596,7 @@ class DualEncoderTrainer:
         compiled = model
         if hasattr(torch, "compile"):
             try:
-                compiled = torch.compile(model)
+                compiled = torch.compile(model, mode="max-autotune")
             except Exception:
                 pass
 
@@ -516,7 +604,7 @@ class DualEncoderTrainer:
         # Use the first shard to estimate; real step count tracked during training.
         first_ctx, first_pos = load_pairs(shard_paths[0], context_window=self._context_window, vocab_size=vocab_size)
         n_pairs_estimate = len(first_pos) * len(shard_paths) * epochs
-        n_batches_estimate = math.ceil(n_pairs_estimate / self._batch_size)
+        n_batches_estimate = max(1, n_pairs_estimate // self._batch_size)
         total_steps = n_batches_estimate
         warmup_steps = int(total_steps * self._warmup_frac)
 
@@ -584,11 +672,17 @@ class DualEncoderTrainer:
                      temperature, device, global_step, verbose=False,
                      amp_dtype=None, scaler=None):
         """Train a single shard of pairs. Returns (shard_loss_float, n_batches, global_step)."""
-        torch = _require_torch()
-        ctx_dev = torch.from_numpy(ctx_np).to(device)
-        pos_dev = torch.from_numpy(pos_np).to(device)
+        import torch
+        is_cuda = str(device).startswith("cuda")
+        if is_cuda:
+            ctx_dev = torch.from_numpy(ctx_np).pin_memory().to(device, non_blocking=True)
+            pos_dev = torch.from_numpy(pos_np).pin_memory().to(device, non_blocking=True)
+            torch.cuda.synchronize(device)
+        else:
+            ctx_dev = torch.from_numpy(ctx_np).to(device)
+            pos_dev = torch.from_numpy(pos_np).to(device)
         n_pairs = len(pos_np)
-        n_batches = math.ceil(n_pairs / self._batch_size)
+        n_batches = max(1, n_pairs // self._batch_size)
         perm = torch.randperm(n_pairs, device=device)
         labels_full = torch.arange(self._batch_size, device=device)
         running_loss = torch.zeros(1, device=device)
@@ -642,6 +736,8 @@ class DualEncoderTrainer:
 
         if is_cuda and torch.cuda.is_available() and torch.cuda.get_device_properties(device).major >= 8:
             torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
         amp_dtype = None
         scaler = None
@@ -651,6 +747,10 @@ class DualEncoderTrainer:
             else:
                 amp_dtype = torch.float16
                 scaler = torch.cuda.amp.GradScaler()
+
+        self._batch_size = _resolve_batch_size(
+            self._batch_size, torch, device, verbose=verbose,
+        )
 
         vocab_size = self._vocab.size
         embed_dim = self._embed_dim
@@ -681,12 +781,12 @@ class DualEncoderTrainer:
         compiled = model
         if hasattr(torch, "compile"):
             try:
-                compiled = torch.compile(model)
+                compiled = torch.compile(model, mode="max-autotune")
             except Exception:
                 pass
 
         n_pairs = len(pos_np)
-        n_batches = math.ceil(n_pairs / self._batch_size)
+        n_batches = max(1, n_pairs // self._batch_size)
         effective_batch = self._batch_size * self._accumulate
         total_steps = math.ceil(n_batches / self._accumulate) * epochs
         warmup_steps = int(total_steps * self._warmup_frac)
@@ -725,6 +825,7 @@ class DualEncoderTrainer:
         labels_full = torch.arange(self._batch_size, device=device)
 
         t_train = time.monotonic()
+        global_step = 0
 
         for epoch in range(1, epochs + 1):
             t_epoch = time.monotonic()
@@ -732,7 +833,6 @@ class DualEncoderTrainer:
             # A single .item() call per epoch (at reporting time) is all we need.
             running_loss = torch.zeros(1, device=device)
             perm = torch.randperm(n_pairs, device=device)
-            global_step = 0
             display_step = 0
 
             batch_range: object = range(n_batches)
@@ -833,7 +933,7 @@ class CharNgramDualEncoderTrainer:
         warmup_frac: float = 0.05,
         min_lr_frac: float = 0.01,
         temperature: float = 0.07,
-        batch_size: int = 2048,
+        batch_size: int = 0,
         accumulate_grad_batches: int = 1,
         clip_grad_norm: float = 1.0,
         seed: int = 42,
@@ -953,7 +1053,7 @@ class CharNgramDualEncoderTrainer:
         words = [self._vocab.id_to_word(i) for i in range(self._vocab.size)]
         self._ngram_to_id = build_ngram_vocab(words, ns=self._ns)
 
-    def _build_word_ngram_table(self, torch) -> "tuple[torch.Tensor, torch.Tensor]":
+    def _build_word_ngram_table(self, torch) -> "torch.Tensor":
         """Precompute a padded (vocab_size, max_ngrams) word→n-gram lookup table."""
         from .char_ngram_encoder import _char_ngrams
         vocab_size = self._vocab.size
@@ -968,15 +1068,10 @@ class CharNgramDualEncoderTrainer:
 
         max_n = max(len(r) for r in rows)
         table = np.zeros((vocab_size, max_n), dtype=np.int64)
-        counts = np.zeros(vocab_size, dtype=np.float32)
         for i, row in enumerate(rows):
             table[i, :len(row)] = row
-            counts[i] = len(row)
 
-        return (
-            torch.from_numpy(table),
-            torch.from_numpy(counts).unsqueeze(1),  # (vocab_size, 1)
-        )
+        return torch.from_numpy(table)
 
     def _train(self, sentences, epochs, torch, verbose):
         ctx_np, pos_np = _precompute_pairs(sentences, self._context_window, verbose=verbose)
@@ -992,6 +1087,8 @@ class CharNgramDualEncoderTrainer:
 
         if is_cuda and torch.cuda.is_available() and torch.cuda.get_device_properties(device).major >= 8:
             torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
         amp_dtype = None
         scaler = None
@@ -1002,14 +1099,18 @@ class CharNgramDualEncoderTrainer:
                 amp_dtype = torch.float16
                 scaler = torch.cuda.amp.GradScaler()
 
-        model, compiled, ngram_table, ngram_counts = self._build_model(torch, device)
+        self._batch_size = _resolve_batch_size(
+            self._batch_size, torch, device, verbose=verbose,
+        )
+
+        model, compiled = self._build_model(torch, device)
         self._model = model
 
         n_pairs_estimate = sum(
             len(load_pairs(p, context_window=self._context_window, vocab_size=self._vocab.size)[1])
             for p in shard_paths[:1]  # use first shard as estimate
         ) * len(shard_paths) * epochs
-        total_steps = max(1, math.ceil(n_pairs_estimate / (self._batch_size * self._accumulate)))
+        total_steps = max(1, n_pairs_estimate // (self._batch_size * self._accumulate))
         warmup_steps = int(total_steps * self._warmup_frac)
         optimizer = torch.optim.AdamW(model.parameters(), lr=self._lr, weight_decay=self._weight_decay)
         scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -1067,11 +1168,17 @@ class CharNgramDualEncoderTrainer:
 
     def _train_shard_arrays(self, ctx_np, pos_np, compiled, optimizer, scheduler, ce_loss, temperature, device, global_step,
                             amp_dtype=None, scaler=None):
-        torch = _require_torch()
-        ctx_dev = torch.from_numpy(ctx_np).to(device)
-        pos_dev = torch.from_numpy(pos_np).to(device)
+        import torch
+        is_cuda = str(device).startswith("cuda")
+        if is_cuda:
+            ctx_dev = torch.from_numpy(ctx_np).pin_memory().to(device, non_blocking=True)
+            pos_dev = torch.from_numpy(pos_np).pin_memory().to(device, non_blocking=True)
+            torch.cuda.synchronize(device)
+        else:
+            ctx_dev = torch.from_numpy(ctx_np).to(device)
+            pos_dev = torch.from_numpy(pos_np).to(device)
         n_pairs = len(pos_np)
-        n_batches = math.ceil(n_pairs / self._batch_size)
+        n_batches = max(1, n_pairs // self._batch_size)
         perm = torch.randperm(n_pairs, device=device)
         labels_full = torch.arange(self._batch_size, device=device)
         running_loss = torch.zeros(1, device=device)
@@ -1119,33 +1226,29 @@ class CharNgramDualEncoderTrainer:
         n_ngrams = len(self._ngram_to_id) + 1
         temperature = self._temperature
 
-        ngram_table, ngram_counts = self._build_word_ngram_table(torch)
+        ngram_table = self._build_word_ngram_table(torch)
         ngram_table = ngram_table.to(device)
-        ngram_counts = ngram_counts.to(device)
 
         nn = torch.nn
 
         class _CharNgramModel(nn.Module):
             def __init__(self_):
                 super().__init__()
-                self_.ctx_embed = nn.Embedding(n_ngrams, embed_dim, padding_idx=0)
-                self_.wrd_embed = nn.Embedding(n_ngrams, embed_dim, padding_idx=0)
+                self_.ctx_embed = nn.EmbeddingBag(n_ngrams, embed_dim, mode='mean', padding_idx=0)
+                self_.wrd_embed = nn.EmbeddingBag(n_ngrams, embed_dim, mode='mean', padding_idx=0)
                 nn.init.xavier_uniform_(self_.ctx_embed.weight)
                 nn.init.xavier_uniform_(self_.wrd_embed.weight)
                 with torch.no_grad():
                     self_.ctx_embed.weight[0] = 0
                     self_.wrd_embed.weight[0] = 0
                 self_.register_buffer("_ng_table", ngram_table)
-                self_.register_buffer("_ng_counts", ngram_counts)
 
             def _embed_words(self_, embed_layer, word_ids):
-                """Mean-pool n-gram embeddings, then L2-normalise per word."""
+                """Mean-pool n-gram embeddings via EmbeddingBag, then L2-normalise."""
                 F = torch.nn.functional
                 ng_ids = self_._ng_table[word_ids]           # (n, max_ngrams)
-                vecs = embed_layer(ng_ids)                    # (n, max_ngrams, dim)
-                counts = self_._ng_counts[word_ids]          # (n, 1)
-                summed = vecs.sum(dim=1)                      # (n, dim)
-                return F.normalize(summed / counts, dim=-1)   # (n, dim)
+                word_vecs = embed_layer(ng_ids)               # (n, dim) — fused
+                return F.normalize(word_vecs, dim=-1)          # (n, dim)
 
             def forward(self_, ctx_ids, pos_ids):
                 F = torch.nn.functional
@@ -1168,11 +1271,11 @@ class CharNgramDualEncoderTrainer:
         compiled = model
         if hasattr(torch, "compile"):
             try:
-                compiled = torch.compile(model)
+                compiled = torch.compile(model, mode="max-autotune")
             except Exception:
                 pass
 
-        return model, compiled, ngram_table, ngram_counts
+        return model, compiled
 
     def _train_from_arrays(self, ctx_np, pos_np, epochs, torch, verbose):
         """Core training loop for the char-ngram model."""
@@ -1187,6 +1290,8 @@ class CharNgramDualEncoderTrainer:
 
         if is_cuda and torch.cuda.is_available() and torch.cuda.get_device_properties(device).major >= 8:
             torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
         amp_dtype = None
         scaler = None
@@ -1197,11 +1302,15 @@ class CharNgramDualEncoderTrainer:
                 amp_dtype = torch.float16
                 scaler = torch.cuda.amp.GradScaler()
 
-        model, compiled, _, _ = self._build_model(torch, device)
+        self._batch_size = _resolve_batch_size(
+            self._batch_size, torch, device, verbose=verbose,
+        )
+
+        model, compiled = self._build_model(torch, device)
         self._model = model
 
         n_pairs = len(pos_np)
-        n_batches = math.ceil(n_pairs / self._batch_size)
+        n_batches = max(1, n_pairs // self._batch_size)
         effective_batch = self._batch_size * self._accumulate
         total_steps = math.ceil(n_batches / self._accumulate) * epochs
         warmup_steps = int(total_steps * self._warmup_frac)
@@ -1239,12 +1348,12 @@ class CharNgramDualEncoderTrainer:
         labels_full = torch.arange(self._batch_size, device=device)
 
         t_train = time.monotonic()
+        global_step = 0
 
         for epoch in range(1, epochs + 1):
             t_epoch = time.monotonic()
             running_loss = torch.zeros(1, device=device)
             perm = torch.randperm(n_pairs, device=device)
-            global_step = 0
             display_step = 0
 
             batch_range: object = range(n_batches)

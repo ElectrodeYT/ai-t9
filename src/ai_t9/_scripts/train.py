@@ -149,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--temperature",    type=float, default=0.07,  help="In-batch negative softmax temperature (default: 0.07)")
 
     # ---- Batch / accumulation -------------------------------------------
-    parser.add_argument("--batch-size",             type=int,   default=2048, help="Pairs per micro-batch (default: 2048; try 4096–8192 on large GPUs)")
+    parser.add_argument("--batch-size",             type=int,   default=0,    help="Pairs per micro-batch. 0 (default) auto-selects based on GPU VRAM; typical auto values are 16384\u2013131072.")
     parser.add_argument("--accumulate-grad-batches", type=int,  default=1,    help="Gradient accumulation steps (default: 1; effective batch = batch-size × this)")
     parser.add_argument("--clip-grad-norm",          type=float, default=1.0, help="Max gradient norm for clipping, 0 to disable (default: 1.0)")
 

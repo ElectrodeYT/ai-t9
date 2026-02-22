@@ -1247,7 +1247,7 @@ class CharNgramDualEncoderTrainer:
                 """Mean-pool n-gram embeddings via EmbeddingBag, then L2-normalise."""
                 F = torch.nn.functional
                 ng_ids = self_._ng_table[word_ids]           # (n, max_ngrams)
-                word_vecs = embed_layer(ng_ids)               # (n, dim) — fused
+                word_vecs = embed_layer(ng_ids).clone()       # (n, dim) — clone for CUDA graph safety
                 return F.normalize(word_vecs, dim=-1)          # (n, dim)
 
             def forward(self_, ctx_ids, pos_ids):

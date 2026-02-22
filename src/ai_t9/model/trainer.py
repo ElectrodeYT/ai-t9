@@ -693,6 +693,8 @@ class DualEncoderTrainer:
             end = min(start + self._batch_size, n_pairs)
             idx = perm[start:end]
 
+            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
                 logits = compiled(ctx_dev[idx], pos_dev[idx], temperature)
                 labels = labels_full[:end - start]
@@ -851,6 +853,8 @@ class DualEncoderTrainer:
                 end = min(start + self._batch_size, n_pairs)
                 idx = perm[start:end]
 
+                if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                    torch.compiler.cudagraph_mark_step_begin()
                 with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                     enabled=amp_dtype is not None):
                     logits = compiled(ctx_dev[idx], pos_dev[idx])
@@ -1053,7 +1057,7 @@ class CharNgramDualEncoderTrainer:
         words = [self._vocab.id_to_word(i) for i in range(self._vocab.size)]
         self._ngram_to_id = build_ngram_vocab(words, ns=self._ns)
 
-    def _build_word_ngram_table(self, torch) -> "torch.Tensor":
+    def _build_word_ngram_table(self, torch) -> "tuple[torch.Tensor, torch.Tensor]":
         """Precompute a padded (vocab_size, max_ngrams) word→n-gram lookup table."""
         from .char_ngram_encoder import _char_ngrams
         vocab_size = self._vocab.size
@@ -1068,10 +1072,15 @@ class CharNgramDualEncoderTrainer:
 
         max_n = max(len(r) for r in rows)
         table = np.zeros((vocab_size, max_n), dtype=np.int64)
+        counts = np.zeros(vocab_size, dtype=np.float32)
         for i, row in enumerate(rows):
             table[i, :len(row)] = row
+            counts[i] = len(row)
 
-        return torch.from_numpy(table)
+        return (
+            torch.from_numpy(table),
+            torch.from_numpy(counts).unsqueeze(1),  # (vocab_size, 1)
+        )
 
     def _train(self, sentences, epochs, torch, verbose):
         ctx_np, pos_np = _precompute_pairs(sentences, self._context_window, verbose=verbose)
@@ -1189,6 +1198,8 @@ class CharNgramDualEncoderTrainer:
             end = min(start + self._batch_size, n_pairs)
             idx = perm[start:end]
 
+            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
                 logits = compiled(ctx_dev[idx], pos_dev[idx])
                 labels = labels_full[:end - start]
@@ -1226,29 +1237,33 @@ class CharNgramDualEncoderTrainer:
         n_ngrams = len(self._ngram_to_id) + 1
         temperature = self._temperature
 
-        ngram_table = self._build_word_ngram_table(torch)
+        ngram_table, ngram_counts = self._build_word_ngram_table(torch)
         ngram_table = ngram_table.to(device)
+        ngram_counts = ngram_counts.to(device)
 
         nn = torch.nn
 
         class _CharNgramModel(nn.Module):
             def __init__(self_):
                 super().__init__()
-                self_.ctx_embed = nn.EmbeddingBag(n_ngrams, embed_dim, mode='mean', padding_idx=0)
-                self_.wrd_embed = nn.EmbeddingBag(n_ngrams, embed_dim, mode='mean', padding_idx=0)
+                self_.ctx_embed = nn.Embedding(n_ngrams, embed_dim, padding_idx=0)
+                self_.wrd_embed = nn.Embedding(n_ngrams, embed_dim, padding_idx=0)
                 nn.init.xavier_uniform_(self_.ctx_embed.weight)
                 nn.init.xavier_uniform_(self_.wrd_embed.weight)
                 with torch.no_grad():
                     self_.ctx_embed.weight[0] = 0
                     self_.wrd_embed.weight[0] = 0
                 self_.register_buffer("_ng_table", ngram_table)
+                self_.register_buffer("_ng_counts", ngram_counts)
 
             def _embed_words(self_, embed_layer, word_ids):
-                """Mean-pool n-gram embeddings via EmbeddingBag, then L2-normalise."""
+                """Mean-pool n-gram embeddings, then L2-normalise per word."""
                 F = torch.nn.functional
                 ng_ids = self_._ng_table[word_ids]           # (n, max_ngrams)
-                word_vecs = embed_layer(ng_ids).clone()       # (n, dim) — clone for CUDA graph safety
-                return F.normalize(word_vecs, dim=-1)          # (n, dim)
+                vecs = embed_layer(ng_ids)                    # (n, max_ngrams, dim)
+                counts = self_._ng_counts[word_ids]          # (n, 1)
+                summed = vecs.sum(dim=1)                      # (n, dim)
+                return F.normalize(summed / counts, dim=-1)   # (n, dim)
 
             def forward(self_, ctx_ids, pos_ids):
                 F = torch.nn.functional
@@ -1271,7 +1286,7 @@ class CharNgramDualEncoderTrainer:
         compiled = model
         if hasattr(torch, "compile"):
             try:
-                compiled = torch.compile(model, mode="max-autotune")
+                compiled = torch.compile(model, mode="max-autotune-no-cudagraphs")
             except Exception:
                 pass
 
@@ -1372,6 +1387,8 @@ class CharNgramDualEncoderTrainer:
                 end = min(start + self._batch_size, n_pairs)
                 idx = perm[start:end]
 
+                if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                    torch.compiler.cudagraph_mark_step_begin()
                 with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                     enabled=amp_dtype is not None):
                     logits = compiled(ctx_dev[idx], pos_dev[idx])

@@ -16,6 +16,7 @@ data/
 corpuses/
 larger-corpuses/
 too-big-stuff/
+modal_data/
 
 # Various . folders
 .venv

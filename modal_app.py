@@ -264,7 +264,7 @@ class Trainer:
         """Train the DualEncoder on GPU from sharded precomputed pairs.
 
         Reads ``vocab.json`` and ``pairs/pairs_*.npz`` from the Volume, writes
-        ``model.npz`` (and optionally ``bigram.npz``) back.
+        ``model.npz`` back. Does not generate the bigram model.
 
         Returns a summary string.
         """
@@ -320,22 +320,8 @@ class Trainer:
             "--device", "cuda",
             "--debug",
         ]
-        print("=== Training DualEncoder ===")
+        print("=== Training Model ===")
         subprocess.run(train_cmd, check=True)
-
-        # Step 2: Train bigram from corpus files (CPU-bound, no GPU needed).
-        if save_ngram:
-            ngram_cmd = [
-                "ai-t9-train",
-                "--vocab", f"{VOLUME_PATH}/vocab.json",
-                "--corpus", str(corpus_dir),
-                "--output", "/dev/null",   # model output discarded; we already have it
-                "--save-ngram", f"{VOLUME_PATH}/bigram.npz",
-                "--epochs", "1",
-            ]
-            print("\n=== Training bigram model ===")
-            subprocess.run(ngram_cmd, check=True)
-
         volume.commit()
 
         artifacts: list[str] = []
@@ -461,7 +447,7 @@ def main(
     # GPU selection
     gpu: str = "L4",
     # Download destination
-    output_dir: str = "data",
+    output_dir: str = "modal_data",
 ):
     """Orchestrate ai-t9 training on Modal.
 
@@ -552,7 +538,10 @@ def main(
             save_ngram=not no_ngram,
         )
         print(result)
-        # Download artifacts
+        print("Done training.")
+        return
+
+    if download:
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
         artifact_names = ["vocab.json", "dict.json", "model.npz", "bigram.npz"]
@@ -562,37 +551,17 @@ def main(
             local_path = out / name
             try:
                 subprocess.run(
-                    ["modal", "volume", "get", VOLUME_NAME, remote_path, str(local_path)],
+                    ["modal", "volume", "get", VOLUME_NAME, remote_path, str(local_path), "--force"],
                     check=True,
                     capture_output=True,
                     text=True,
                 )
                 size_mb = local_path.stat().st_size / 1e6
                 print(f"  {name}: {size_mb:.1f} MB")
-            except subprocess.CalledProcessError:
+            except subprocess.CalledProcessError as e:
                 print(f"  {name}: (not found on volume, skipping)")
-        print("Done.")
-        return
-
-    if download:
-        out = Path(output_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        artifact_names = ["vocab.json", "dict.json", "model.npz", "bigram.npz"]
-        print(f"Downloading artifacts to {out}/")
-        for name in artifact_names:
-            remote_path = name
-            local_path = out / name
-            try:
-                subprocess.run(
-                    ["modal", "volume", "get", VOLUME_NAME, remote_path, str(local_path)],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                size_mb = local_path.stat().st_size / 1e6
-                print(f"  {name}: {size_mb:.1f} MB")
-            except subprocess.CalledProcessError:
-                print(f"  {name}: (not found on volume, skipping)")
+                print(f"    Error details: {e.stderr.strip()}")
+                print(f"    StdOut: {e.stdout.strip()}")
         print("Done downloading artifacts.")
         return
 

@@ -52,6 +52,11 @@ class DualEncoder:
         self._vocab = vocab
         self._dim = context_embeds.shape[1]
 
+        # 1-slot context cache — encode_context() is called on every keypress
+        # with the same context; caching eliminates redundant computation.
+        self._ctx_cache_key: tuple[int, ...] | None = None
+        self._ctx_cache_vec: np.ndarray | None = None
+
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
@@ -59,16 +64,29 @@ class DualEncoder:
     def encode_context(self, context_ids: Sequence[int]) -> np.ndarray:
         """Produce a context vector by mean-pooling context word embeddings.
 
+        Results are cached by context key — repeated calls with the same context
+        (common during a typing burst) return the cached vector immediately.
+
         If context_ids is empty, returns the zero vector.
         """
+        key = tuple(context_ids)
+        if key == self._ctx_cache_key and self._ctx_cache_vec is not None:
+            return self._ctx_cache_vec
+
+        vec = self._encode_context_impl(context_ids)
+        self._ctx_cache_key = key
+        self._ctx_cache_vec = vec
+        return vec
+
+    def _encode_context_impl(self, context_ids: Sequence[int]) -> np.ndarray:
         if not context_ids:
             return np.zeros(self._dim, dtype=np.float32)
-        vecs = self._ctx[list(context_ids)]     # (n, dim)
-        ctx_vec = vecs.mean(axis=0)             # (dim,)
+        vecs = self._ctx[np.asarray(context_ids, dtype=np.intp)]  # (n, dim)
+        ctx_vec = vecs.mean(axis=0)                                 # (dim,)
         norm = np.linalg.norm(ctx_vec)
         if norm > 0:
-            ctx_vec /= norm
-        return ctx_vec
+            ctx_vec = ctx_vec / norm
+        return ctx_vec.astype(np.float32)
 
     def score_candidates(
         self,

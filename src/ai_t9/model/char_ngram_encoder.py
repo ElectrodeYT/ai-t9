@@ -13,15 +13,17 @@ stores two embedding matrices indexed by character n-gram ID rather than word ID
     ctx_embeds[ngram_id]  — how ngram_id looks in context (preceding words)
     wrd_embeds[ngram_id]  — how ngram_id looks as a target word
 
-At inference, for a word string ``w``:
+At load time, both matrices are expanded into dense per-word vectors for all
+vocab words, stored as ``_ctx_matrix`` and ``_word_matrix``.  At inference:
 
-    ngrams  = char_ngrams(w, ns=(2, 3))         # e.g. ["<th","the","he>","<t","th","he","e>"]
-    ids     = [ngram_to_id[g] for g in ngrams]  # OOV n-grams → UNK_NGRAM_ID (0), ignored
-    embed_w = mean(wrd_embeds[ids])              # (dim,)
+    ctx_vec  = normalise(mean(_ctx_matrix[context_ids]))   # (dim,)
+    scores   = _word_matrix[candidate_ids] @ ctx_vec       # (n_cands,)
 
-Because every English word decomposes into bigrams and trigrams that are
-virtually certain to have been seen during training, **new words added to the
-T9 dictionary receive meaningful embeddings with zero retraining**.
+This pre-computation makes scoring as fast as DualEncoder (single matmul) while
+keeping the model size small (n_ngrams × dim instead of vocab_size × dim).
+
+Open-vocabulary scoring of OOV words is still available via ``score_word()``,
+which uses the raw ngram embeddings directly.
 
 N-gram vocabulary
 -----------------
@@ -36,8 +38,11 @@ very slowly (new English words almost never introduce new bigrams/trigrams).
 
 Size comparison (dim=264, vocab_size=29,470)
 --------------------------------------------
-    DualEncoder       :  29,470 × 264 × 2 × 4 B  ≈  62 MB RAM
-    CharNgramDualEncoder:  8,734 × 264 × 2 × 4 B  ≈  18 MB RAM
+    DualEncoder            :  29,470 × 264 × 2 × 4 B  ≈  62 MB RAM
+    CharNgramDualEncoder   :   8,734 × 264 × 2 × 4 B  ≈  18 MB (ngram mats)
+                           + 29,470 × 264 × 2 × 4 B  ≈  62 MB (pre-computed)
+
+For mobile targets use dim=64-96 to keep the pre-computed matrices small.
 
 Interface
 ---------
@@ -104,9 +109,11 @@ class CharNgramDualEncoder:
     Pure NumPy — no ML framework required at inference time.
 
     This is a drop-in replacement for DualEncoder with the same public interface.
-    The key difference is that embeddings are indexed by character n-gram rather
-    than word ID, so new words added to the T9 dictionary get embeddings
-    automatically without any retraining.
+    Word embeddings are pre-computed at load time from the n-gram matrices,
+    making candidate scoring as fast as a plain DualEncoder (single matmul).
+
+    Open-vocabulary scoring (``score_word()``) is still available for words not
+    in the vocabulary, using the raw ngram embeddings directly.
     """
 
     def __init__(
@@ -122,7 +129,7 @@ class CharNgramDualEncoder:
             context_embeds: float32 (n_ngrams, embed_dim) — context role
             word_embeds:    float32 (n_ngrams, embed_dim) — target role
             ngram_to_id:    mapping from n-gram string to row index
-            vocab:          Vocabulary (used only for word ID → string lookups)
+            vocab:          Vocabulary (used to build per-word pre-computed matrices)
             ns:             n-gram sizes used during training (default: (2, 3))
         """
         assert context_embeds.shape == word_embeds.shape, (
@@ -139,61 +146,120 @@ class CharNgramDualEncoder:
         self._dim = context_embeds.shape[1]
         self._n_ngrams = context_embeds.shape[0]
 
-        # Cache: word_id → pre-computed int32 n-gram ID array.
-        # Filled lazily on first access; most queries touch a small candidate
-        # set repeatedly across a typing session, so this pays off quickly.
-        self._ngram_id_cache: dict[int, np.ndarray] = {}
+        # Pre-compute dense (vocab_size, dim) matrices for fast lookup.
+        # Each row is the L2-normalised mean of a word's n-gram embeddings,
+        # matching the per-word normalisation applied during training.
+        self._ctx_matrix, self._word_matrix = self._precompute_word_matrices()
+
+        # 1-slot context cache — encode_context() is called on every keypress
+        # with the same context window; caching the result eliminates redundant
+        # computation within a typing burst.
+        self._ctx_cache_key: tuple[int, ...] | None = None
+        self._ctx_cache_vec: np.ndarray | None = None
 
     # ------------------------------------------------------------------
-    # N-gram helpers
+    # Pre-computation
+    # ------------------------------------------------------------------
+
+    def _precompute_word_matrices(self) -> tuple[np.ndarray, np.ndarray]:
+        """Build dense (vocab_size, dim) word matrices from n-gram embeddings.
+
+        For each word in the vocabulary:
+          1. Collect its n-gram IDs (falling back to UNK_NGRAM_ID=0 for OOV ngrams)
+          2. Mean-pool the corresponding rows from ctx_embeds / wrd_embeds
+          3. L2-normalise the resulting vector
+
+        The per-word L2 normalisation matches the training forward pass, where
+        each word embedding is normalised before being pooled into the context
+        vector — correcting the subtle discrepancy that existed in the old
+        inference path.
+
+        Returns:
+            ctx_matrix  : float32 (vocab_size, dim) — for encode_context
+            word_matrix : float32 (vocab_size, dim) — for score_candidates
+        """
+        vocab_size = self._vocab.size
+
+        # Build padded (vocab_size, max_ngrams) index table.
+        rows: list[list[int]] = []
+        for wid in range(vocab_size):
+            word = self._vocab.id_to_word(wid)
+            ids = [
+                self._ngram_to_id.get(g, _UNK_NGRAM_ID)
+                for g in _char_ngrams(word, self._ns)
+            ]
+            # Filter UNK so they don't dilute the mean (same as training).
+            ids = [i for i in ids if i != _UNK_NGRAM_ID] or [_UNK_NGRAM_ID]
+            rows.append(ids)
+
+        max_n = max(len(r) for r in rows)
+        table = np.zeros((vocab_size, max_n), dtype=np.int32)
+        counts = np.zeros(vocab_size, dtype=np.float32)
+        for i, row in enumerate(rows):
+            table[i, : len(row)] = row
+            counts[i] = len(row)
+
+        # Vectorised mean-pool: (vocab_size, max_n, dim) → (vocab_size, dim)
+        def _build_matrix(embed: np.ndarray) -> np.ndarray:
+            # embed: (n_ngrams, dim)
+            vecs = embed[table]              # (vocab_size, max_n, dim)
+            summed = vecs.sum(axis=1)        # (vocab_size, dim)
+            means = summed / counts[:, None] # (vocab_size, dim)
+            # L2-normalise each row.
+            norms = np.linalg.norm(means, axis=1, keepdims=True).clip(min=1e-8)
+            return (means / norms).astype(np.float32)
+
+        ctx_matrix = _build_matrix(self._ctx)
+        word_matrix = _build_matrix(self._wrd)
+        return ctx_matrix, word_matrix
+
+    # ------------------------------------------------------------------
+    # N-gram helpers (kept for score_word OOV path)
     # ------------------------------------------------------------------
 
     def _ngram_ids(self, word: str) -> np.ndarray:
         """Return an int32 array of n-gram IDs for ``word``.
 
-        OOV n-grams map to _UNK_NGRAM_ID (0), whose embedding row is zeroed.
+        OOV n-grams map to _UNK_NGRAM_ID (0), which is filtered out so it
+        doesn't dilute the mean.
         """
         ids = [
             self._ngram_to_id.get(g, _UNK_NGRAM_ID)
             for g in _char_ngrams(word, self._ns)
         ]
-        # Filter UNKs so they don't dilute the mean — same effect as zeroing,
-        # but avoids storing lots of zero rows in the mean computation.
         ids = [i for i in ids if i != _UNK_NGRAM_ID] or [_UNK_NGRAM_ID]
         return np.array(ids, dtype=np.int32)
-
-    def _wid_ngram_ids(self, wid: int) -> np.ndarray:
-        """Return cached n-gram ID array for vocab word ID ``wid``."""
-        if wid not in self._ngram_id_cache:
-            word = self._vocab.id_to_word(wid)
-            self._ngram_id_cache[wid] = self._ngram_ids(word)
-        return self._ngram_id_cache[wid]
-
-    def _embed_word_ids(self, matrix: np.ndarray, wid: int) -> np.ndarray:
-        """Mean-pool n-gram embeddings from ``matrix`` for word ID ``wid``."""
-        ids = self._wid_ngram_ids(wid)
-        return matrix[ids].mean(axis=0)
 
     # ------------------------------------------------------------------
     # Inference (same interface as DualEncoder)
     # ------------------------------------------------------------------
 
     def encode_context(self, context_ids: Sequence[int]) -> np.ndarray:
-        """Produce a context vector by mean-pooling n-gram context embeddings.
+        """Produce a context vector by mean-pooling pre-computed context embeddings.
 
-        Each context word is first embedded via its n-grams; those per-word
-        vectors are then mean-pooled and L2-normalised.
+        Results are cached by context key — repeated calls with the same context
+        (common during a typing burst) return the cached vector immediately.
+
         If context_ids is empty, returns the zero vector.
         """
+        key = tuple(context_ids)
+        if key == self._ctx_cache_key and self._ctx_cache_vec is not None:
+            return self._ctx_cache_vec
+
+        vec = self._encode_context_impl(context_ids)
+        self._ctx_cache_key = key
+        self._ctx_cache_vec = vec
+        return vec
+
+    def _encode_context_impl(self, context_ids: Sequence[int]) -> np.ndarray:
         if not context_ids:
             return np.zeros(self._dim, dtype=np.float32)
-        word_vecs = np.stack(
-            [self._embed_word_ids(self._ctx, wid) for wid in context_ids]
-        )                                       # (n_ctx, dim)
-        ctx_vec = word_vecs.mean(axis=0)        # (dim,)
+        # Each row of _ctx_matrix is already L2-normalised per-word.
+        word_vecs = self._ctx_matrix[np.asarray(context_ids, dtype=np.intp)]  # (n, dim)
+        ctx_vec = word_vecs.mean(axis=0)                                        # (dim,)
         norm = np.linalg.norm(ctx_vec)
         if norm > 0:
-            ctx_vec /= norm
+            ctx_vec = ctx_vec / norm
         return ctx_vec.astype(np.float32)
 
     def score_candidates(
@@ -211,21 +277,23 @@ class CharNgramDualEncoder:
         """
         if not candidate_ids:
             return np.array([], dtype=np.float32)
-        ctx_vec = self.encode_context(context_ids)          # (dim,)
-        cand_vecs = np.stack(
-            [self._embed_word_ids(self._wrd, wid) for wid in candidate_ids]
-        )                                                    # (n_cands, dim)
-        return (cand_vecs @ ctx_vec).astype(np.float32)     # (n_cands,)
+        ctx_vec = self.encode_context(context_ids)                                # (dim,)
+        cand_vecs = self._word_matrix[np.asarray(candidate_ids, dtype=np.intp)]  # (n, dim)
+        return (cand_vecs @ ctx_vec).astype(np.float32)
 
     def score_word(self, context_ids: Sequence[int], word: str) -> float:
         """Score an arbitrary word string (not necessarily in the vocab).
 
         This is the key open-vocabulary method: any word, even one never seen
-        during training, can be scored against context.
+        during training, can be scored against context using the raw n-gram
+        embeddings.
         """
         ctx_vec = self.encode_context(context_ids)
         ids = self._ngram_ids(word)
         wrd_vec = self._wrd[ids].mean(axis=0)
+        norm = np.linalg.norm(wrd_vec)
+        if norm > 0:
+            wrd_vec = wrd_vec / norm
         return float(wrd_vec @ ctx_vec)
 
     # ------------------------------------------------------------------

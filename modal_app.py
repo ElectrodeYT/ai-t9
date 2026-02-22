@@ -14,12 +14,14 @@ Architecture overview::
     ┌────────────────────────▼───────────────────────────────────────┐
     │  prep  (CPU, long timeout)                                    │
     │    • ai-t9-build-vocab --corpus /corpus/... --output /vol/    │
-    │    • ai-t9-train --save-pairs /vol/pairs.npz --pairs-only     │
+    │    • ai-t9-train --save-pairs /vol/pairs/pairs                │
+    │          --shard-size 10000000 --pairs-only                   │
     └────────────────────────┬───────────────────────────────────────┘
-                             │ pairs.npz + vocab.json on Volume
+                             │ pairs/pairs_*.npz + vocab.json on Volume
     ┌────────────────────────▼───────────────────────────────────────┐
     │  train  (GPU, modal.Retries for preemption)                   │
-    │    • ai-t9-train --load-pairs /vol/pairs.npz --output /vol/   │
+    │    • ai-t9-train --pairs-dir /vol/pairs/ --output /vol/       │
+    │         --accumulate-grad-batches 4                           │
     │    • optionally trains bigram model                           │
     └────────────────────────┬───────────────────────────────────────┘
                              │ model.npz + bigram.npz on Volume
@@ -43,25 +45,25 @@ Prerequisites:
 Usage::
 
     # Full pipeline: prep data on CPU → train on GPU → download artifacts
-    modal run modal_app.py
+    modal run modal_app.py --prep --train
 
     # Train only (pairs already precomputed on the Volume)
-    modal run modal_app.py --skip-prep
+    modal run modal_app.py --train
 
     # Prep only (precompute pairs, skip training)
-    modal run modal_app.py --prep-only
+    modal run modal_app.py --prep
 
     # Override training hyperparameters
-    modal run modal_app.py --epochs 10 --embed-dim 128 --batch-size 4096 --gpu A100
+    modal run modal_app.py --train --epochs 10 --embed-dim 128 --batch-size 8192 --gpu A100
 
     # Use a different corpus prefix in the R2 bucket
-    modal run modal_app.py --corpus-prefix corpuses/
+    modal run modal_app.py --prep --corpus-prefix corpuses/
 
     # Download artifacts from the Volume without running anything
-    modal run modal_app.py --download-only
+    modal run modal_app.py --download
 
     # Long-running training in the background (survives terminal disconnect)
-    modal run --detach modal_app.py --epochs 20 --gpu H100
+    modal run --detach modal_app.py --train --epochs 20 --gpu H100
 
 All flags::
 
@@ -69,6 +71,8 @@ All flags::
 """
 
 from __future__ import annotations
+
+import sys
 
 import modal
 
@@ -84,13 +88,20 @@ R2_SECRET_NAME = "r2-credentials"
 
 # Default training hyperparameters (mirror ai-t9-train defaults but sized up
 # for cloud GPU runs).
-DEFAULT_EPOCHS = 5
-DEFAULT_EMBED_DIM = 264
+DEFAULT_EPOCHS = 3
+DEFAULT_EMBED_DIM = 64
 DEFAULT_CONTEXT_WINDOW = 3
-DEFAULT_NEG_SAMPLES = 20
-DEFAULT_LR = 0.005
-DEFAULT_BATCH_SIZE = 4096
+DEFAULT_LR = 0.001
+DEFAULT_WEIGHT_DECAY = 1e-4
+DEFAULT_WARMUP_FRAC = 0.05
+DEFAULT_TEMPERATURE = 0.07
+DEFAULT_BATCH_SIZE = 8192
+DEFAULT_ACCUMULATE = 4          # effective batch = 8192 × 4 = 32768 on an A100
+DEFAULT_CLIP_GRAD_NORM = 1.0
 DEFAULT_SEED = 42
+DEFAULT_SHARD_SIZE = 10_000_000  # 10M pairs per shard
+
+PAIRS_DIR = f"{VOLUME_PATH}/pairs"
 
 # ---------------------------------------------------------------------------
 # Modal resources
@@ -140,7 +151,7 @@ def _r2_mount(bucket_name: str, endpoint_url: str) -> modal.CloudBucketMount:
 
 
 # ---------------------------------------------------------------------------
-# Prep function (CPU — build vocab + precompute pairs)
+# Prep function (CPU — build vocab + precompute sharded pairs)
 # ---------------------------------------------------------------------------
 
 @app.function(
@@ -154,17 +165,23 @@ def prep(
     context_window: int = DEFAULT_CONTEXT_WINDOW,
     max_words: int = 500_000,
     min_count: int = 20,
+    shard_size: int = DEFAULT_SHARD_SIZE,
     use_volume_corpus: bool = False,
 ) -> str:
-    """Build vocabulary, dictionary, and precompute training pairs.
+    """Build vocabulary, dictionary, and precompute sharded training pairs.
 
     When ``use_volume_corpus`` is True, reads corpus files from the Volume
     (``/vol/corpuses/``) instead of the R2 mount. Useful when you've already
     uploaded corpus files to the Volume via ``modal volume put``.
 
+    Pairs are written as shards to ``/vol/pairs/pairs_000.npz``, etc. so the
+    training function can stream them one shard at a time, keeping GPU VRAM
+    usage independent of corpus size.
+
     Returns a summary string.
     """
     import subprocess
+    from pathlib import Path
 
     actual_corpus = f"{VOLUME_PATH}/corpuses" if use_volume_corpus else corpus_path
 
@@ -182,29 +199,35 @@ def prep(
     print(f"=== Building vocabulary from {actual_corpus} ===")
     subprocess.run(vocab_cmd, check=True)
 
-    # -- Precompute pairs --------------------------------------------------
+    # -- Precompute sharded pairs ------------------------------------------
+    pairs_prefix = f"{PAIRS_DIR}/pairs"
     pairs_cmd = [
         "ai-t9-train",
         "--vocab", f"{VOLUME_PATH}/vocab.json",
         "--corpus", actual_corpus,
-        "--save-pairs", f"{VOLUME_PATH}/pairs.npz",
+        "--save-pairs", pairs_prefix,
+        "--shard-size", str(shard_size),
         "--pairs-only",
         "--context-window", str(context_window),
         "--output", "/dev/null",   # not used with --pairs-only
     ]
-    print(f"\n=== Precomputing training pairs ===")
+    print(f"\n=== Precomputing training pairs (shard size: {shard_size:,}) ===")
     subprocess.run(pairs_cmd, check=True)
 
     volume.commit()
 
     # Summarise what was written.
-    from pathlib import Path
     artifacts = []
-    for name in ("vocab.json", "dict.json", "pairs.npz"):
+    for name in ("vocab.json", "dict.json"):
         p = Path(VOLUME_PATH) / name
         if p.exists():
             size_mb = p.stat().st_size / 1e6
             artifacts.append(f"  {name}: {size_mb:.1f} MB")
+    pairs_dir = Path(PAIRS_DIR)
+    if pairs_dir.is_dir():
+        shards = sorted(pairs_dir.glob("pairs_*.npz"))
+        total_mb = sum(p.stat().st_size for p in shards) / 1e6
+        artifacts.append(f"  pairs/: {len(shards)} shard(s), {total_mb:.1f} MB total")
     summary = "Prep complete. Volume contents:\n" + "\n".join(artifacts)
     print(f"\n{summary}")
     return summary
@@ -228,15 +251,19 @@ class Trainer:
         epochs: int = DEFAULT_EPOCHS,
         embed_dim: int = DEFAULT_EMBED_DIM,
         context_window: int = DEFAULT_CONTEXT_WINDOW,
-        neg_samples: int = DEFAULT_NEG_SAMPLES,
         lr: float = DEFAULT_LR,
+        weight_decay: float = DEFAULT_WEIGHT_DECAY,
+        warmup_frac: float = DEFAULT_WARMUP_FRAC,
+        temperature: float = DEFAULT_TEMPERATURE,
         batch_size: int = DEFAULT_BATCH_SIZE,
+        accumulate_grad_batches: int = DEFAULT_ACCUMULATE,
+        clip_grad_norm: float = DEFAULT_CLIP_GRAD_NORM,
         seed: int = DEFAULT_SEED,
         save_ngram: bool = True,
     ) -> str:
-        """Train the DualEncoder on GPU from precomputed pairs.
+        """Train the DualEncoder on GPU from sharded precomputed pairs.
 
-        Reads ``vocab.json`` and ``pairs.npz`` from the Volume, writes
+        Reads ``vocab.json`` and ``pairs/pairs_*.npz`` from the Volume, writes
         ``model.npz`` (and optionally ``bigram.npz``) back.
 
         Returns a summary string.
@@ -247,6 +274,9 @@ class Trainer:
         # Reload volume to pick up any recent prep output
         volume.reload()
 
+        effective_batch = batch_size * accumulate_grad_batches
+        print(f"Effective batch size: {effective_batch:,} ({batch_size:,} × {accumulate_grad_batches} accumulation steps)")
+
         # Check if bigram training is possible (requires corpus files)
         corpus_dir = Path(VOLUME_PATH) / "corpuses"
         has_corpus = corpus_dir.is_dir() and any(corpus_dir.glob("*.txt"))
@@ -254,20 +284,38 @@ class Trainer:
             print("Note: No corpus files on Volume; skipping bigram model.")
             save_ngram = False
 
-        # Step 1: Train the embedding model from precomputed pairs.
-        # --load-pairs and --corpus are mutually exclusive in the CLI,
-        # so we train the model first, then build the bigram separately.
+        # Resolve pairs input: prefer sharded directory, fall back to single file.
+        pairs_dir = Path(PAIRS_DIR)
+        has_shards = pairs_dir.is_dir() and any(pairs_dir.glob("pairs_*.npz"))
+        single_pairs = Path(VOLUME_PATH) / "pairs.npz"
+
+        if has_shards:
+            pairs_args = ["--pairs-dir", str(pairs_dir)]
+        elif single_pairs.exists():
+            print(f"Note: No sharded pairs found in {PAIRS_DIR}; using single file {single_pairs}.")
+            pairs_args = ["--load-pairs", str(single_pairs)]
+        else:
+            raise FileNotFoundError(
+                f"No training pairs found. Run prep first (expects {PAIRS_DIR}/pairs_*.npz "
+                f"or {single_pairs})."
+            )
+
+        # Step 1: Train the embedding model.
         train_cmd = [
             "ai-t9-train",
             "--vocab", f"{VOLUME_PATH}/vocab.json",
-            "--load-pairs", f"{VOLUME_PATH}/pairs.npz",
+            *pairs_args,
             "--output", f"{VOLUME_PATH}/model.npz",
             "--epochs", str(epochs),
             "--embed-dim", str(embed_dim),
             "--context-window", str(context_window),
-            "--neg-samples", str(neg_samples),
             "--lr", str(lr),
+            "--weight-decay", str(weight_decay),
+            "--warmup-frac", str(warmup_frac),
+            "--temperature", str(temperature),
             "--batch-size", str(batch_size),
+            "--accumulate-grad-batches", str(accumulate_grad_batches),
+            "--clip-grad-norm", str(clip_grad_norm),
             "--seed", str(seed),
             "--device", "cuda",
             "--debug",
@@ -396,13 +444,18 @@ def main(
     use_volume_corpus: bool = False,
     max_words: int = 500_000,
     min_count: int = 20,
+    shard_size: int = DEFAULT_SHARD_SIZE,
     # Training hyperparameters
     epochs: int = DEFAULT_EPOCHS,
     embed_dim: int = DEFAULT_EMBED_DIM,
     context_window: int = DEFAULT_CONTEXT_WINDOW,
-    neg_samples: int = DEFAULT_NEG_SAMPLES,
     lr: float = DEFAULT_LR,
+    weight_decay: float = DEFAULT_WEIGHT_DECAY,
+    warmup_frac: float = DEFAULT_WARMUP_FRAC,
+    temperature: float = DEFAULT_TEMPERATURE,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    accumulate_grad_batches: int = DEFAULT_ACCUMULATE,
+    clip_grad_norm: float = DEFAULT_CLIP_GRAD_NORM,
     seed: int = DEFAULT_SEED,
     no_ngram: bool = False,
     # GPU selection
@@ -429,8 +482,9 @@ def main(
 
     Training flags are forwarded to ``ai-t9-train``:
 
-      --epochs, --embed-dim, --context-window, --neg-samples,
-      --lr, --batch-size, --seed, --no-ngram
+      --epochs, --embed-dim, --context-window, --lr, --weight-decay,
+      --warmup-frac, --temperature, --batch-size, --accumulate-grad-batches,
+      --clip-grad-norm, --seed, --no-ngram
 
     GPU selection:
 
@@ -470,12 +524,12 @@ def main(
         return
 
     if prep:
-        effective_use_volume_corpus = use_volume_corpus  # Assume corpus is on volume for prep-only
         result = prep.remote(
             context_window=context_window,
             max_words=max_words,
             min_count=min_count,
-            use_volume_corpus=effective_use_volume_corpus,
+            shard_size=shard_size,
+            use_volume_corpus=use_volume_corpus,
         )
         print(result)
         return
@@ -487,9 +541,13 @@ def main(
             epochs=epochs,
             embed_dim=embed_dim,
             context_window=context_window,
-            neg_samples=neg_samples,
             lr=lr,
+            weight_decay=weight_decay,
+            warmup_frac=warmup_frac,
+            temperature=temperature,
             batch_size=batch_size,
+            accumulate_grad_batches=accumulate_grad_batches,
+            clip_grad_norm=clip_grad_norm,
             seed=seed,
             save_ngram=not no_ngram,
         )

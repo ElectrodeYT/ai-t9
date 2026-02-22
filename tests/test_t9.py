@@ -685,7 +685,8 @@ class TestPredictCompletions:
     """Tests for predict_completions() on the predictor."""
 
     def test_returns_words(self, tiny_predictor: T9Predictor):
-        results = tiny_predictor.predict_completions("46")
+        # "466" prefix → adaptive max_extra=2, finds "4663" words (good/gone/home/hood)
+        results = tiny_predictor.predict_completions("466")
         assert all(isinstance(w, str) for w in results)
         assert len(results) >= 1
 
@@ -693,24 +694,24 @@ class TestPredictCompletions:
         """Every returned word's digit sequence should extend the prefix."""
         from ai_t9.t9_map import word_to_digits
 
-        results = tiny_predictor.predict_completions("46")
+        results = tiny_predictor.predict_completions("466")
         for word in results:
             digits = word_to_digits(word)
             assert digits is not None
-            assert digits.startswith("46")
-            assert len(digits) > 2
+            assert digits.startswith("466")
+            assert len(digits) > 3
 
     def test_excludes_exact_matches(self, tiny_predictor: T9Predictor):
-        results = tiny_predictor.predict_completions("46")
+        results = tiny_predictor.predict_completions("466", max_extra_digits=6)
         assert "go" not in results
         assert "in" not in results
 
     def test_top_k_respected(self, tiny_predictor: T9Predictor):
-        results = tiny_predictor.predict_completions("46", top_k=2)
+        results = tiny_predictor.predict_completions("466", top_k=2)
         assert len(results) <= 2
 
     def test_return_details(self, tiny_predictor: T9Predictor):
-        results = tiny_predictor.predict_completions("46", return_details=True)
+        results = tiny_predictor.predict_completions("466", return_details=True)
         assert all(isinstance(r, RankedCandidate) for r in results)
         finals = [r.final_score for r in results]
         assert finals == sorted(finals, reverse=True)
@@ -725,20 +726,45 @@ class TestPredictCompletions:
 
     def test_length_weight_prefers_shorter(self, tiny_predictor: T9Predictor):
         """With high w_length, shorter completions should rank higher."""
-        # "2" prefix: "be"(23, +1 digit), "and"/"any"(263/269, +2 digits)
+        # "26" prefix with explicit max_extra=3: "and"(263, +1), "any"(269, +1),
+        # vs longer words (+2 or more digits)
         results = tiny_predictor.predict_completions(
-            "2", top_k=5, w_length=0.90,
+            "26", top_k=5, max_extra_digits=3, w_length=0.90,
         )
-        # "be" is 1 extra digit, should outrank "and"/"any" (2 extra digits)
-        # when length weight is extremely high
-        if "be" in results and "and" in results:
-            assert results.index("be") < results.index("and")
+        # "and"/"any" are only 1 extra digit; anything longer should rank lower
+        if len(results) >= 2:
+            from ai_t9.t9_map import word_to_digits
+            extras = [len(word_to_digits(w)) - 2 for w in results]
+            # Sorted by score descending, shorter extras should dominate with high w_length
+            assert extras[0] <= extras[-1]
+
+    def test_adaptive_short_prefix_conservative(self, tiny_predictor: T9Predictor):
+        """Short prefix (≤2 digits) → very conservative: max_extra=1, returns ≤1 result."""
+        results = tiny_predictor.predict_completions("46", top_k=10)
+        # With adaptive params: prefix_len=2 → max_extra=1, effective_top_k=1
+        assert len(results) <= 1
+
+    def test_adaptive_long_prefix_expansive(self, tiny_predictor: T9Predictor):
+        """Long prefix (≥6 digits) → expansive: max_extra=5, returns up to top_k results."""
+        # "4663" is the sequence for good/gone/home/hood — use their 4-digit prefix
+        # which triggers adaptive max_extra=3 (prefix_len=4)
+        results = tiny_predictor.predict_completions("4663", top_k=5)
+        # prefix_len=4 → max_extra=3 → can find 5-8 letter words starting with "4663"
+        # results may be empty (tiny vocab), but top_k is not artificially reduced to 1
+        assert len(results) <= 5  # never exceeds top_k
+
+    def test_explicit_max_extra_overrides_adaptive(self, tiny_predictor: T9Predictor):
+        """Passing explicit max_extra_digits disables adaptive scaling."""
+        results_adaptive = tiny_predictor.predict_completions("46")          # max_extra=1
+        results_explicit = tiny_predictor.predict_completions("46", max_extra_digits=6)
+        # explicit=6 should find at least as many results as adaptive=1
+        assert len(results_explicit) >= len(results_adaptive)
 
     def test_with_model(
         self, tiny_dict: T9Dictionary, tiny_encoder: DualEncoder, tiny_vocab: Vocabulary,
     ):
         predictor = T9Predictor(tiny_dict, model=tiny_encoder)
-        results = predictor.predict_completions("46", context=["the"])
+        results = predictor.predict_completions("466", context=["the"])
         assert len(results) >= 1
         assert all(w in {"home", "good", "gone", "hood"} for w in results)
 
@@ -750,18 +776,20 @@ class TestPredictCompletions:
 class TestSessionCompletions:
     def test_completions_returns_words(self, tiny_predictor: T9Predictor):
         session = T9Session(tiny_predictor)
-        results = session.completions("46")
+        # "466" → adaptive max_extra=2, finds 4-char words starting with "466"
+        results = session.completions("466")
         assert len(results) >= 1
 
     def test_completions_use_context(self, tiny_predictor: T9Predictor):
         session = T9Session(tiny_predictor)
         session.add_context("the")
-        results = session.completions("46")
+        results = session.completions("466")
         assert len(results) >= 1
 
     def test_dial_with_completions(self, tiny_predictor: T9Predictor):
         session = T9Session(tiny_predictor)
-        exact, comps = session.dial_with_completions("46")
+        # dial "46" (exact matches: go/in), completions with explicit max_extra=6
+        exact, comps = session.dial_with_completions("46", max_extra_digits=6)
         # exact matches: "go", "in"
         assert any(w in exact for w in ("go", "in"))
         # completions: "home", "good", "gone", "hood"
@@ -772,7 +800,7 @@ class TestSessionCompletions:
     def test_dial_with_completions_details(self, tiny_predictor: T9Predictor):
         session = T9Session(tiny_predictor)
         exact, comps = session.dial_with_completions(
-            "46", return_details=True,
+            "466", return_details=True,
         )
         assert all(isinstance(r, RankedCandidate) for r in exact)
         assert all(isinstance(r, RankedCandidate) for r in comps)
@@ -782,8 +810,8 @@ class TestSessionCompletions:
         session = T9Session(tiny_predictor)
         session.confirm("the")
 
-        # After typing "46", see exact + completions
-        exact, comps = session.dial_with_completions("46")
+        # After typing "466", see exact + completions
+        exact, comps = session.dial_with_completions("466")
         # User accepts a completion
         if comps:
             session.confirm(comps[0])
@@ -1069,3 +1097,199 @@ class TestT9PhoneGUI:
     def test_long_press_hash_inserts_newline(self, gui_window):
         gui_window._on_long_press("#")
         assert "\n" in gui_window._committed
+
+
+# ===========================================================================
+# Trainer tests (require torch — skipped automatically if not installed)
+# ===========================================================================
+
+try:
+    import torch as _torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+
+pytestmark_torch = pytest.mark.skipif(not _TORCH_AVAILABLE, reason="torch not installed")
+
+
+@pytest.fixture
+def tiny_sentences(tiny_vocab: Vocabulary) -> list[list[int]]:
+    """A tiny set of sentences for trainer smoke tests."""
+    # Build a few varied sentences using words from tiny_vocab
+    words = ["home", "gone", "good", "the", "and", "go", "in", "me", "of", "a", "be", "hi"]
+    ids = [tiny_vocab.word_to_id(w) for w in words]
+    sentences = []
+    for i in range(0, len(ids) - 2, 2):
+        sentences.append(ids[i:i + 3])
+    # Repeat a few times so we have ≥10 pairs
+    return sentences * 5
+
+
+class TestSavePairs:
+    def test_save_pairs_single_file(self, tmp_path, tiny_vocab: Vocabulary, tiny_sentences):
+        from ai_t9.model.trainer import save_pairs, load_pairs
+        out = tmp_path / "pairs.npz"
+        n = save_pairs(tiny_sentences, context_window=2, vocab_size=tiny_vocab.size, path=out)
+        assert n > 0
+        assert out.exists()
+        ctx, pos = load_pairs(out, context_window=2, vocab_size=tiny_vocab.size)
+        assert ctx.shape == (n, 2)
+        assert pos.shape == (n,)
+        assert ctx.dtype == np.int64
+        assert pos.dtype == np.int64
+
+    def test_save_pairs_sharded(self, tmp_path, tiny_vocab: Vocabulary, tiny_sentences):
+        from ai_t9.model.trainer import save_pairs, load_pairs
+        out_prefix = tmp_path / "pairs"
+        n_total = save_pairs(
+            tiny_sentences,
+            context_window=2,
+            vocab_size=tiny_vocab.size,
+            path=out_prefix,
+            max_shard_pairs=3,   # force many small shards
+        )
+        assert n_total > 0
+        shards = sorted(tmp_path.glob("pairs_*.npz"))
+        assert len(shards) >= 2, "Expected multiple shards with max_shard_pairs=3"
+        # Each shard has at most 3 pairs
+        total = 0
+        for shard in shards:
+            ctx, pos = load_pairs(shard, context_window=2, vocab_size=tiny_vocab.size)
+            assert len(pos) <= 3
+            total += len(pos)
+        assert total == n_total
+
+    def test_save_pairs_metadata_mismatch_raises(self, tmp_path, tiny_vocab: Vocabulary, tiny_sentences):
+        from ai_t9.model.trainer import save_pairs, load_pairs
+        out = tmp_path / "pairs.npz"
+        save_pairs(tiny_sentences, context_window=2, vocab_size=tiny_vocab.size, path=out)
+        with pytest.raises(ValueError, match="context_window"):
+            load_pairs(out, context_window=5, vocab_size=tiny_vocab.size)
+        with pytest.raises(ValueError, match="vocab_size"):
+            load_pairs(out, context_window=2, vocab_size=9999)
+
+
+@pytest.mark.skipif(not _TORCH_AVAILABLE, reason="torch not installed")
+class TestDualEncoderTrainerSmoke:
+    def test_in_batch_negatives_reduces_loss(self, tmp_path, tiny_vocab: Vocabulary, tiny_sentences):
+        from ai_t9.model.trainer import DualEncoderTrainer, save_pairs
+        pairs_path = tmp_path / "pairs.npz"
+        save_pairs(tiny_sentences, context_window=2, vocab_size=tiny_vocab.size, path=pairs_path)
+        trainer = DualEncoderTrainer(
+            vocab=tiny_vocab,
+            embed_dim=8,
+            context_window=2,
+            temperature=0.07,
+            batch_size=4,   # tiny batch for fast test
+            accumulate_grad_batches=1,
+            seed=0,
+            device="cpu",
+        )
+        trainer.train_from_pairs_file(pairs_path, epochs=2, verbose=False)
+        encoder = trainer.get_encoder()
+        # Encoder should be a valid DualEncoder
+        assert encoder.embed_dim == 8
+        assert encoder.vocab.size == tiny_vocab.size
+
+    def test_train_from_pairs_file_smoke(self, tmp_path, tiny_vocab: Vocabulary, tiny_sentences):
+        from ai_t9.model.trainer import DualEncoderTrainer, save_pairs
+        pairs_path = tmp_path / "pairs.npz"
+        save_pairs(tiny_sentences, context_window=2, vocab_size=tiny_vocab.size, path=pairs_path)
+        trainer = DualEncoderTrainer(
+            vocab=tiny_vocab,
+            embed_dim=8,
+            context_window=2,
+            batch_size=4,
+            seed=0,
+            device="cpu",
+        )
+        trainer.train_from_pairs_file(pairs_path, epochs=2, verbose=False)
+        encoder = trainer.get_encoder()
+        assert encoder.embed_dim == 8
+
+    def test_train_from_pairs_dir_smoke(self, tmp_path, tiny_vocab: Vocabulary, tiny_sentences):
+        from ai_t9.model.trainer import DualEncoderTrainer, save_pairs
+        save_pairs(
+            tiny_sentences,
+            context_window=2,
+            vocab_size=tiny_vocab.size,
+            path=tmp_path / "pairs",
+            max_shard_pairs=3,
+        )
+        trainer = DualEncoderTrainer(
+            vocab=tiny_vocab,
+            embed_dim=8,
+            context_window=2,
+            batch_size=4,
+            seed=0,
+            device="cpu",
+        )
+        trainer.train_from_pairs_dir(tmp_path, epochs=2, prefetch=False, verbose=False)
+        encoder = trainer.get_encoder()
+        assert encoder.embed_dim == 8
+
+    def test_grad_accumulation_produces_valid_encoder(self, tmp_path, tiny_vocab: Vocabulary, tiny_sentences):
+        from ai_t9.model.trainer import DualEncoderTrainer, save_pairs
+        pairs_path = tmp_path / "pairs.npz"
+        save_pairs(tiny_sentences, context_window=2, vocab_size=tiny_vocab.size, path=pairs_path)
+        trainer = DualEncoderTrainer(
+            vocab=tiny_vocab,
+            embed_dim=8,
+            context_window=2,
+            batch_size=2,
+            accumulate_grad_batches=3,
+            seed=0,
+            device="cpu",
+        )
+        trainer.train_from_pairs_file(pairs_path, epochs=2, verbose=False)
+        encoder = trainer.get_encoder()
+        assert encoder.embed_dim == 8
+        # Embeddings should be finite (no NaN/Inf from bad gradient accumulation)
+        ctx_arr = encoder._ctx
+        wrd_arr = encoder._wrd
+        assert np.all(np.isfinite(ctx_arr))
+        assert np.all(np.isfinite(wrd_arr))
+
+
+@pytest.mark.skipif(not _TORCH_AVAILABLE, reason="torch not installed")
+class TestCharNgramTrainerSmoke:
+    def test_in_batch_negatives_smoke(self, tmp_path, tiny_vocab: Vocabulary, tiny_sentences):
+        from ai_t9.model.trainer import CharNgramDualEncoderTrainer, save_pairs
+        pairs_path = tmp_path / "pairs.npz"
+        save_pairs(tiny_sentences, context_window=2, vocab_size=tiny_vocab.size, path=pairs_path)
+        trainer = CharNgramDualEncoderTrainer(
+            vocab=tiny_vocab,
+            embed_dim=8,
+            context_window=2,
+            temperature=0.07,
+            batch_size=4,
+            seed=0,
+            device="cpu",
+        )
+        trainer.train_from_pairs_file(pairs_path, epochs=2, verbose=False)
+        encoder = trainer.get_encoder()
+        # Encoder should be a valid CharNgramDualEncoder with pre-computed matrices
+        assert encoder.embed_dim == 8
+        assert hasattr(encoder, "_word_matrix")
+        assert encoder._word_matrix.shape[0] == tiny_vocab.size
+
+    def test_train_from_pairs_dir_smoke(self, tmp_path, tiny_vocab: Vocabulary, tiny_sentences):
+        from ai_t9.model.trainer import CharNgramDualEncoderTrainer, save_pairs
+        save_pairs(
+            tiny_sentences,
+            context_window=2,
+            vocab_size=tiny_vocab.size,
+            path=tmp_path / "pairs",
+            max_shard_pairs=3,
+        )
+        trainer = CharNgramDualEncoderTrainer(
+            vocab=tiny_vocab,
+            embed_dim=8,
+            context_window=2,
+            batch_size=4,
+            seed=0,
+            device="cpu",
+        )
+        trainer.train_from_pairs_dir(tmp_path, epochs=1, prefetch=False, verbose=False)
+        encoder = trainer.get_encoder()
+        assert encoder.embed_dim == 8

@@ -7,7 +7,7 @@ Usage::
 
     # Train on a single corpus file
     ai-t9-train --vocab data/vocab.json --corpus mytext.txt --output data/model.npz \\
-                --epochs 5 --embed-dim 64 --neg-samples 20
+                --epochs 5 --embed-dim 64 --temperature 0.07
 
     # Train on a folder of corpus files (all *.txt files are combined)
     ai-t9-train --vocab data/vocab.json --corpus corpuses/ --output data/model.npz
@@ -19,9 +19,17 @@ Usage::
     ai-t9-train --vocab data/vocab.json --corpus corpuses/ \\
                 --save-pairs data/pairs.npz --pairs-only
 
+    # Precompute into shards (large corpora that don't fit in RAM):
+    ai-t9-train --vocab data/vocab.json --corpus corpuses/ \\
+                --save-pairs data/pairs/pairs.npz --shard-size 10000000 --pairs-only
+
     # GPU training job that reuses saved pairs (no corpus loading):
     ai-t9-train --vocab data/vocab.json --load-pairs data/pairs.npz \\
                 --output data/model.npz --epochs 10
+
+    # GPU training from a directory of sharded pairs:
+    ai-t9-train --vocab data/vocab.json --pairs-dir data/pairs/ \\
+                --output data/model.npz --epochs 10 --accumulate-grad-batches 4
 """
 
 from __future__ import annotations
@@ -53,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Train ai-t9 DualEncoder model"
     )
+
+    # ---- Input / output -------------------------------------------------
     parser.add_argument(
         "--vocab",
         metavar="FILE",
@@ -79,19 +89,15 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="If given, also save a trained bigram model to this path.",
     )
-    parser.add_argument("--epochs",           type=int,   default=3,    help="Training epochs (default: 3)")
-    parser.add_argument("--embed-dim",        type=int,   default=64,   help="Embedding dimension (default: 64)")
-    parser.add_argument("--context-window",   type=int,   default=3,    help="Context words to use (default: 3)")
-    parser.add_argument("--neg-samples",      type=int,   default=20,   help="Negatives per positive, sampled on GPU (default: 20)")
-    parser.add_argument("--lr",               type=float, default=0.005,help="Learning rate (default: 0.005)")
-    parser.add_argument("--batch-size",       type=int,   default=2048, help="Pairs per batch (default: 2048; try 4096–8192 on large GPUs)")
-    parser.add_argument("--seed",             type=int,   default=42,   help="Random seed (default: 42)")
+
+    # ---- Pairs precomputation / loading ----------------------------------
     parser.add_argument(
         "--save-pairs",
         metavar="FILE",
         default=None,
         help="After loading the corpus, precompute training pairs and save them "
-             "to this .npz file.  Use with --pairs-only to skip training entirely.",
+             "to this .npz file (or shard prefix when --shard-size is set). "
+             "Use with --pairs-only to skip training entirely.",
     )
     parser.add_argument(
         "--load-pairs",
@@ -101,10 +107,54 @@ def main(argv: list[str] | None = None) -> int:
              "Skips all corpus I/O and pair computation — ideal for GPU cloud jobs.",
     )
     parser.add_argument(
+        "--pairs-dir",
+        metavar="DIR",
+        default=None,
+        help="Directory of sharded pairs files (pairs_*.npz) to train from. "
+             "Alternative to --load-pairs for large corpora. "
+             "Shards are shuffled each epoch for gradient diversity.",
+    )
+    parser.add_argument(
+        "--shard-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Maximum pairs per shard when using --save-pairs. "
+             "When set, writes pairs_000.npz, pairs_001.npz, … "
+             "(default: None — single file).",
+    )
+    parser.add_argument(
         "--pairs-only",
         action="store_true",
         help="Only precompute and save pairs (requires --save-pairs); exit without training.",
     )
+
+    # ---- Model architecture ---------------------------------------------
+    parser.add_argument(
+        "--model-type",
+        choices=["dual-encoder", "char-ngram"],
+        default="char-ngram",
+        help="Model architecture to train (default: char-ngram, which is more accurate "
+             "but slightly slower than dual-encoder)",
+    )
+    parser.add_argument("--embed-dim",      type=int,   default=64,    help="Embedding dimension (default: 64)")
+    parser.add_argument("--context-window", type=int,   default=3,     help="Context words to use (default: 3)")
+
+    # ---- Optimiser / schedule -------------------------------------------
+    parser.add_argument("--epochs",         type=int,   default=3,     help="Training epochs (default: 3)")
+    parser.add_argument("--lr",             type=float, default=0.001, help="Peak learning rate (default: 0.001)")
+    parser.add_argument("--weight-decay",   type=float, default=1e-4,  help="AdamW weight decay (default: 1e-4)")
+    parser.add_argument("--warmup-frac",    type=float, default=0.05,  help="Fraction of steps used for linear LR warmup (default: 0.05)")
+    parser.add_argument("--min-lr-frac",    type=float, default=0.01,  help="Cosine decay floor as fraction of peak LR (default: 0.01)")
+    parser.add_argument("--temperature",    type=float, default=0.07,  help="In-batch negative softmax temperature (default: 0.07)")
+
+    # ---- Batch / accumulation -------------------------------------------
+    parser.add_argument("--batch-size",             type=int,   default=2048, help="Pairs per micro-batch (default: 2048; try 4096–8192 on large GPUs)")
+    parser.add_argument("--accumulate-grad-batches", type=int,  default=1,    help="Gradient accumulation steps (default: 1; effective batch = batch-size × this)")
+    parser.add_argument("--clip-grad-norm",          type=float, default=1.0, help="Max gradient norm for clipping, 0 to disable (default: 1.0)")
+
+    # ---- Misc -----------------------------------------------------------
+    parser.add_argument("--seed",  type=int, default=42,   help="Random seed (default: 42)")
     parser.add_argument(
         "--device",
         default="auto",
@@ -116,12 +166,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Print timestamped phase breakdown to diagnose startup bottlenecks",
     )
-    parser.add_argument(
-        "--model-type",
-        choices=["dual-encoder", "char-ngram"],
-        default="char-ngram",
-        help="Model architecture to train (default: char-ngram, which is more accurate but slightly slower than dual-encoder)",
-    )
+
     args = parser.parse_args(argv)
 
     from ai_t9.model.vocab import Vocabulary
@@ -142,11 +187,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.pairs_only and not args.save_pairs:
         print("ERROR: --pairs-only requires --save-pairs", file=sys.stderr)
         return 1
-    if args.load_pairs and args.corpus:
-        print("ERROR: --load-pairs and --corpus are mutually exclusive", file=sys.stderr)
+
+    input_sources = sum([
+        bool(args.load_pairs),
+        bool(args.pairs_dir),
+        bool(args.corpus),
+    ])
+    if input_sources > 1:
+        print("ERROR: --load-pairs, --pairs-dir, and --corpus are mutually exclusive", file=sys.stderr)
         return 1
     if args.load_pairs and args.pairs_only:
         print("ERROR: --load-pairs and --pairs-only are mutually exclusive", file=sys.stderr)
+        return 1
+    if args.pairs_dir and args.pairs_only:
+        print("ERROR: --pairs-dir and --pairs-only are mutually exclusive", file=sys.stderr)
+        return 1
+    if args.pairs_dir and args.save_pairs:
+        print("ERROR: --pairs-dir and --save-pairs are mutually exclusive", file=sys.stderr)
         return 1
 
     # ---- Load vocabulary -------------------------------------------------
@@ -160,28 +217,47 @@ def main(argv: list[str] | None = None) -> int:
     vocab = Vocabulary.load(vocab_path)
     print(f"  {vocab.size} words loaded")
 
-    # ---- Train dual encoder ---------------------------------------------
+    # ---- Build trainer --------------------------------------------------
     trainer = TrainerCls(
         vocab=vocab,
         embed_dim=args.embed_dim,
         context_window=args.context_window,
-        neg_samples=args.neg_samples,
         lr=args.lr,
+        weight_decay=args.weight_decay,
+        warmup_frac=args.warmup_frac,
+        min_lr_frac=args.min_lr_frac,
+        temperature=args.temperature,
         batch_size=args.batch_size,
+        accumulate_grad_batches=args.accumulate_grad_batches,
+        clip_grad_norm=args.clip_grad_norm,
         seed=args.seed,
         device=args.device,
         debug=args.debug,
     )
 
-    if args.load_pairs:
-        # Fast path: skip corpus loading, use precomputed pairs directly.
+    # ---- Train ----------------------------------------------------------
+    # corpus_files may be set below; initialize here so the bigram section can
+    # always reference it regardless of which training path was taken.
+    corpus_files = None
+
+    if args.pairs_dir:
+        # Sharded-directory path: shuffle shards each epoch, optional prefetch.
+        pairs_dir = Path(args.pairs_dir)
+        if not pairs_dir.is_dir():
+            print(f"ERROR: pairs directory not found: {pairs_dir}", file=sys.stderr)
+            return 1
+        trainer.train_from_pairs_dir(pairs_dir, epochs=args.epochs, verbose=True)
+
+    elif args.load_pairs:
+        # Single-file path: skip corpus loading, use precomputed pairs directly.
         pairs_path = Path(args.load_pairs)
         if not pairs_path.exists():
             print(f"ERROR: pairs file not found: {pairs_path}", file=sys.stderr)
             return 1
         trainer.train_from_pairs_file(pairs_path, epochs=args.epochs, verbose=True)
+
     else:
-        # Load corpus, optionally save pairs, optionally train.
+        # Corpus path: load sentences, optionally save pairs, optionally train.
         if args.corpus:
             corpus_files = _resolve_corpus_files(Path(args.corpus))
             if corpus_files is None:
@@ -194,7 +270,7 @@ def main(argv: list[str] | None = None) -> int:
                 save_pairs,
             )
             print("Loading corpus for pair precomputation…")
-            if args.corpus:
+            if corpus_files:
                 sentences: list[list[int]] = []
                 for p in corpus_files:
                     sentences.extend(_corpus_file_sentence_ids(p, vocab))
@@ -207,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
                 vocab_size=vocab.size,
                 path=pairs_out,
                 verbose=True,
+                max_shard_pairs=args.shard_size,
             )
             print(f"Precomputed {n:,} pairs → {pairs_out}")
             if args.pairs_only:
@@ -214,7 +291,8 @@ def main(argv: list[str] | None = None) -> int:
             # Train from the just-written file (validates the roundtrip too).
             resolved = pairs_out if str(pairs_out).endswith(".npz") else Path(str(pairs_out) + ".npz")
             trainer.train_from_pairs_file(resolved, epochs=args.epochs, verbose=True)
-        elif args.corpus:
+
+        elif corpus_files:
             trainer.train_from_files(corpus_files, epochs=args.epochs, verbose=True)
         else:
             trainer.train_from_nltk(epochs=args.epochs, verbose=True)
@@ -228,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
         from ai_t9.ngram import BigramScorer
         from ai_t9.model.trainer import _corpus_file_sentence_ids
         print("Training bigram model…")
-        if args.corpus:
+        if corpus_files:
             scorer = BigramScorer(vocab)
             for path in corpus_files:
                 sents = _corpus_file_sentence_ids(path, vocab)

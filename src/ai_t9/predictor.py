@@ -100,26 +100,32 @@ class T9Predictor:
         context: Sequence[str] = (),
         top_k: int = 5,
         completions: bool = False,
-        max_extra_digits: int = 6,
+        max_extra_digits: int | None = None,
         w_length: float = 0.30,
+        min_model_score: float = 0.0,
         return_details: bool = False,
         trace: bool = False,
     ) -> "list[str] | list[RankedCandidate] | tuple[list[RankedCandidate], dict]":
         """Return the top-k predicted words for the given digit sequence.
 
         Args:
-            digit_seq:      T9 digit string, e.g. ``"4663"``
-            context:        Previously typed words (most recent last),
-                            e.g. ``["i", "am", "going"]``
-            top_k:          Number of results to return (default 5)
-            completions:    If True, predict completions extending the digit prefix
-                            instead of exact matches.
-            max_extra_digits: Maximum extra digits for completions (ignored if completions=False)
-            w_length:       Weight for length bonus in completions (ignored if completions=False)
-            return_details: If True, return RankedCandidate objects with score
-                            breakdown instead of plain strings.
-            trace:          If True, return a tuple of (ranked_candidates, trace_dict)
-                            instead of just the results. Forces return_details=True.
+            digit_seq:        T9 digit string, e.g. ``"4663"``
+            context:          Previously typed words (most recent last),
+                              e.g. ``["i", "am", "going"]``
+            top_k:            Number of results to return (default 5)
+            completions:      If True, predict completions extending the digit prefix
+                              instead of exact matches.
+            max_extra_digits: Maximum extra digits for completions.  ``None`` (default)
+                              activates adaptive scaling based on prefix length.
+                              Ignored when completions=False.
+            w_length:         Weight for length bonus in completions (ignored if completions=False)
+            min_model_score:  When > 0 and a model is loaded, completion candidates whose
+                              normalised model score falls below this threshold are filtered out.
+                              Ignored for exact-match prediction and when no model is loaded.
+            return_details:   If True, return RankedCandidate objects with score
+                              breakdown instead of plain strings.
+            trace:            If True, return a tuple of (ranked_candidates, trace_dict)
+                              instead of just the results. Forces return_details=True.
 
         Returns:
             List of word strings (default) or RankedCandidate objects, or tuple with trace.
@@ -131,6 +137,7 @@ class T9Predictor:
             is_completions=completions,
             max_extra_digits=max_extra_digits,
             w_length=w_length,
+            min_model_score=min_model_score,
             return_details=return_details,
             trace=trace,
         )
@@ -140,8 +147,9 @@ class T9Predictor:
         digit_prefix: str,
         context: Sequence[str] = (),
         top_k: int = 5,
-        max_extra_digits: int = 6,
+        max_extra_digits: int | None = None,
         w_length: float = 0.30,
+        min_model_score: float = 0.0,
         return_details: bool = False,
     ) -> "list[str] | list[RankedCandidate]":
         """Return top-k word completions extending the given digit prefix.
@@ -149,6 +157,11 @@ class T9Predictor:
         Like :meth:`predict` but searches for words *longer* than the typed
         digits.  A **length bonus** signal favours shorter completions (fewer
         remaining keypresses).
+
+        Completions are scaled adaptively by default (``max_extra_digits=None``):
+        short prefixes are conservative (huge fan-out = noisy), long prefixes
+        are expansive (few candidates = reliable).  Pass an explicit integer to
+        override this behaviour.
 
         Scoring::
 
@@ -162,10 +175,10 @@ class T9Predictor:
         Args:
             digit_prefix:     Partial T9 digit string, e.g. ``"466"``
             context:          Previously typed words (most recent last)
-            top_k:            Number of results to return
-            max_extra_digits: Maximum extra digits beyond the prefix to consider
+            top_k:            Number of results to return (adaptive mode may reduce this)
+            max_extra_digits: Maximum extra digits beyond the prefix.  ``None`` → adaptive.
             w_length:         Weight for the completion-length bonus ∈ [0, 1).
-                              Higher values bias toward shorter completions.
+            min_model_score:  Filter completions below this normalised model score.
             return_details:   If True, return :class:`RankedCandidate` objects.
 
         Returns:
@@ -178,6 +191,7 @@ class T9Predictor:
             completions=True,
             max_extra_digits=max_extra_digits,
             w_length=w_length,
+            min_model_score=min_model_score,
             return_details=return_details,
             trace=False,
         )
@@ -230,8 +244,9 @@ class T9Predictor:
         context: Sequence[str],
         top_k: int,
         is_completions: bool,
-        max_extra_digits: int = 6,
+        max_extra_digits: int | None = None,
         w_length: float = 0.30,
+        min_model_score: float = 0.0,
         return_details: bool = False,
         trace: bool = False,
     ) -> "list[str] | list[RankedCandidate] | tuple[list[RankedCandidate], dict]":
@@ -241,6 +256,12 @@ class T9Predictor:
                 f"Invalid digit sequence {digit_seq!r}. "
                 "Use digits 2-9 only (T9 keypad)."
             )
+
+        # Resolve adaptive completion parameters.
+        if is_completions:
+            if max_extra_digits is None:
+                max_extra_digits, top_k = _adaptive_completion_params(len(digit_seq), top_k)
+            # else: caller supplied explicit values, use them as-is
 
         _t0 = time.perf_counter_ns() if trace else 0
 
@@ -320,6 +341,20 @@ class T9Predictor:
             ngram_raw = None
             ngram_norm = np.zeros(len(word_ids_list), dtype=np.float32)
         _tn1 = time.perf_counter_ns() if trace else 0
+
+        # ── Stage 4b: model-score gate (completions only) ────────────
+        if is_completions and min_model_score > 0.0 and model_norm is not None:
+            keep = model_norm >= min_model_score
+            if keep.any() and not keep.all():
+                words = tuple(w for w, k in zip(words, keep) if k)
+                word_ids_list = [wid for wid, k in zip(word_ids_list, keep) if k]
+                full_digits = tuple(fd for fd, k in zip(full_digits, keep) if k)
+                freq_raw = freq_raw[keep]
+                freq_norm = freq_norm[keep]
+                model_raw = model_raw[keep] if model_raw is not None else None
+                model_norm = model_norm[keep]
+                ngram_raw = ngram_raw[keep] if ngram_raw is not None else None
+                ngram_norm = ngram_norm[keep]
 
         # ── Stage 5: length bonus (completions only) ──────────────────
         if is_completions:
@@ -483,6 +518,31 @@ def _load_model_auto(path: "str | Path", vocab: Vocabulary) -> "DualEncoder":
         from .model.char_ngram_encoder import CharNgramDualEncoder
         return CharNgramDualEncoder.load(path, vocab)
     return DualEncoder.load(path, vocab)
+
+
+def _adaptive_completion_params(prefix_len: int, top_k: int) -> tuple[int, int]:
+    """Return (max_extra_digits, effective_top_k) scaled to prefix length.
+
+    Short prefixes → conservative (huge fan-out, completions are noisy).
+    Long prefixes  → expansive (few candidates, completions are reliable).
+
+    prefix_len | max_extra_digits | effective_top_k
+        1-2    |       1          |   1
+         3     |       2          |   2
+         4     |       3          |   max(2, top_k // 2)
+         5     |       4          |   max(3, top_k * 2 // 3)
+        6+     |       5          |   top_k
+    """
+    if prefix_len <= 2:
+        return 1, 1
+    if prefix_len == 3:
+        return 2, 2
+    if prefix_len == 4:
+        return 3, max(2, top_k // 2)
+    if prefix_len == 5:
+        return 4, max(3, top_k * 2 // 3)
+    return 5, top_k
+
 
 def _normalise(scores: np.ndarray) -> np.ndarray:
     """Rank-based normalisation to [0, 1].

@@ -86,8 +86,9 @@ class T9Session:
         self,
         digit_prefix: str,
         top_k: int = 5,
-        max_extra_digits: int = 6,
+        max_extra_digits: int | None = None,
         w_length: float = 0.30,
+        min_model_score: float = 0.0,
         return_details: bool = False,
     ) -> list[str] | list[RankedCandidate]:
         """Predict word completions for a partially typed digit sequence.
@@ -95,12 +96,21 @@ class T9Session:
         Like :meth:`dial` but returns words *longer* than the input, offering
         autocompletion suggestions.  Uses the current context for ranking.
 
+        By default, the number of completions and the search depth scale
+        adaptively with the prefix length (more digits typed → more and deeper
+        completions, since the candidate set is smaller and more reliable).
+        Pass an explicit ``max_extra_digits`` integer to override this.
+
         Args:
             digit_prefix:     Partial T9 digit sequence, e.g. ``"466"``
-            top_k:            Number of completions to return
-            max_extra_digits: Maximum additional digits beyond the prefix
+            top_k:            Maximum completions to return (adaptive mode may
+                              reduce this for short prefixes)
+            max_extra_digits: Maximum additional digits beyond the prefix.
+                              ``None`` (default) → adaptive scaling.
             w_length:         Weight for the length bonus (higher → prefer
                               shorter completions)
+            min_model_score:  Filter completions below this normalised model
+                              score (0.0 = no filtering).
             return_details:   Return RankedCandidate objects with score breakdown
 
         Returns:
@@ -112,6 +122,7 @@ class T9Session:
             top_k=top_k,
             max_extra_digits=max_extra_digits,
             w_length=w_length,
+            min_model_score=min_model_score,
             return_details=return_details,
         )
 
@@ -120,8 +131,9 @@ class T9Session:
         digit_seq: str,
         top_k: int = 5,
         completion_k: int = 3,
-        max_extra_digits: int = 6,
+        max_extra_digits: int | None = None,
         w_length: float = 0.30,
+        min_model_score: float = 0.0,
         return_details: bool = False,
     ) -> tuple[
         list[str] | list[RankedCandidate],
@@ -131,6 +143,9 @@ class T9Session:
 
         Convenience method combining :meth:`dial` and :meth:`completions`
         in a single call — useful for UIs that show both sections.
+
+        ``max_extra_digits=None`` (default) uses adaptive scaling: the search
+        depth and number of completions returned grow with the prefix length.
 
         Returns:
             ``(exact_matches, completions)`` — two separate lists.
@@ -143,6 +158,7 @@ class T9Session:
             top_k=completion_k,
             max_extra_digits=max_extra_digits,
             w_length=w_length,
+            min_model_score=min_model_score,
             return_details=return_details,
         )
         return exact, comps

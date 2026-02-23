@@ -119,6 +119,7 @@ image = (
         "numpy>=1.24",
         "nltk>=3.8",
         "datasets>=2.0",
+        "hf-transfer>=0.1.8",
         "torch>=2.0",
         "tqdm>=4.0",
     )

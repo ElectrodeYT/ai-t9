@@ -18,6 +18,9 @@ import os
 from datasets import load_dataset
 import nltk
 
+# Enable hf_transfer for faster downloads
+os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER', '1')
+
 # Ensure NLTK punkt tokenizer is available
 nltk.download('punkt', quiet=True)
 

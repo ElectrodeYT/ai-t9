@@ -256,6 +256,10 @@ def cmd_fetch_hf(
         print("ERROR: 'datasets' package required: pip install datasets", file=sys.stderr)
         return 1
 
+    # Enable hf_transfer for faster downloads
+    import os
+    os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER', '1')
+
     if verbose:
         limit_str = f", limit={max_lines:,}" if max_lines else ""
         print(f"Fetching HuggingFace dataset: {dataset}/{config} split={split}{limit_str}")
@@ -371,6 +375,10 @@ def cmd_fetch_hf_local(
     except ImportError:
         print("ERROR: 'datasets' package required: pip install datasets", file=sys.stderr)
         return 1
+
+    # Enable hf_transfer for faster downloads
+    import os
+    os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER', '1')
 
     local = Path(local_path)
     local.parent.mkdir(parents=True, exist_ok=True)

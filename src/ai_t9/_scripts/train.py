@@ -56,7 +56,11 @@ def _resolve_corpus_files(corpus_path: Path) -> list[Path] | None:
 
 def _load_hf_texts(args) -> list[str]:
     """Load texts from HuggingFace dataset."""
+    import os
     from datasets import load_dataset
+    
+    # Enable hf_transfer for faster downloads
+    os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER', '1')
     
     print(f"Loading HuggingFace dataset: {args.hf_dataset}")
     if args.hf_config:

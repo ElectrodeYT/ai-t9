@@ -31,13 +31,19 @@ Usage:
 
     # Skip specific steps on the remote (e.g. corpus already in S3)
     python scripts/vast_orchestrate.py configs/vast-large.yaml --skip corpus --skip vocab
+
+    # Use a custom Docker image (package pre-installed — no wheel upload needed)
+    python scripts/vast_orchestrate.py configs/vast-large.yaml \\
+        --image ai-t9-trainer:latest --install skip
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -79,6 +85,39 @@ _FORWARD_ENV_KEYS = [
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _build_local_wheel() -> Path:
+    """Build a wheel from the local project source. Returns the .whl path.
+
+    The wheel is placed in a temporary directory that persists for the
+    lifetime of the process; the caller does not need to clean it up.
+
+    Raises ``RuntimeError`` if the build fails.
+    """
+    project_root = Path(__file__).parent.parent
+    wheel_dir = Path(tempfile.mkdtemp(prefix="ai_t9_wheel_"))
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "pip", "wheel",
+            ".",
+            "--no-deps",
+            "--wheel-dir", str(wheel_dir),
+            "--quiet",
+        ],
+        cwd=str(project_root),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Wheel build failed (exit {result.returncode}):\n"
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    wheels = list(wheel_dir.glob("ai_t9-*.whl"))
+    if not wheels:
+        raise RuntimeError(f"No ai_t9-*.whl found after build in {wheel_dir}")
+    return wheels[0]
 
 
 def _read_remote_output_dir(config_path: Path) -> str:
@@ -164,6 +203,19 @@ def main(argv: list[str] | None = None) -> int:
         help="Print the cheapest matching offer and exit without provisioning",
     )
 
+    # Package installation
+    parser.add_argument(
+        "--install",
+        choices=["wheel", "skip"],
+        default="wheel",
+        help=(
+            "How to install ai-t9 on the remote instance. "
+            "'wheel' (default) builds a wheel from local source and uploads it — "
+            "always installs the exact working-tree version without needing PyPI. "
+            "'skip' assumes the Docker image already has the package installed."
+        ),
+    )
+
     # SSH tuning
     parser.add_argument(
         "--ssh-retries",
@@ -208,6 +260,18 @@ def main(argv: list[str] | None = None) -> int:
 
     # Collect env vars to forward to the remote instance
     forward_env = {k: os.environ[k] for k in _FORWARD_ENV_KEYS if os.environ.get(k)}
+
+    # ---- Build wheel before touching the instance --------------------------
+    # Do this early so a build failure doesn't cost money.
+    wheel_path: Path | None = None
+    if args.install == "wheel":
+        print("Building local wheel…")
+        try:
+            wheel_path = _build_local_wheel()
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(f"  Built: {wheel_path.name}")
 
     # ---- Dry run -----------------------------------------------------------
     if args.dry_run:
@@ -280,14 +344,20 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         # ---- Install ai-t9 ------------------------------------------------
-        print("Installing ai-t9[train,data]…")
-        exit_code = ssh_run(
-            client,
-            'pip install --quiet "ai-t9[train,data]" pyyaml 2>&1 | tail -5',
-        )
-        if exit_code != 0:
-            print("ERROR: Failed to install ai-t9", file=sys.stderr)
-            return 1
+        if args.install == "wheel":
+            remote_wheel = f"/tmp/{wheel_path.name}"
+            print(f"Uploading wheel → {remote_wheel}")
+            scp_upload(client, wheel_path, remote_wheel)
+            print("Installing ai-t9 from wheel…")
+            exit_code = ssh_run(
+                client,
+                f'pip install --quiet "{remote_wheel}[train,data]" 2>&1 | tail -5',
+            )
+            if exit_code != 0:
+                print("ERROR: Failed to install ai-t9 from wheel", file=sys.stderr)
+                return 1
+        else:
+            print("Skipping package installation (--install skip)")
 
         # ---- Upload config -------------------------------------------------
         remote_config = "/root/train_config.yaml"

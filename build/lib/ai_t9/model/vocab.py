@@ -146,3 +146,41 @@ class Vocabulary:
             return self
         return Vocabulary(new_words, new_counts)
 
+    @classmethod
+    def build_from_nltk(
+        cls,
+        max_words: int = 50_000,
+        min_count: int = 2,
+        verbose: bool = True,
+    ) -> "Vocabulary":
+        """Build vocabulary from the NLTK Brown corpus.
+
+        Downloads NLTK data automatically on first use (~15 MB).
+        """
+        try:
+            import nltk
+        except ImportError:
+            raise ImportError("nltk is required: pip install nltk")
+
+        for resource in ("brown", "words"):
+            try:
+                nltk.data.find(f"corpora/{resource}")
+            except LookupError:
+                if verbose:
+                    print(f"Downloading NLTK '{resource}' corpus…")
+                nltk.download(resource, quiet=not verbose)
+
+        from nltk.corpus import brown
+
+        if verbose:
+            print("Counting words in Brown corpus…")
+        counter: Counter = Counter()
+        for word in brown.words():
+            w = word.lower()
+            if w.isalpha():
+                counter[w] += 1
+
+        vocab = cls.build_from_counts(counter, max_words=max_words, min_count=min_count)
+        if verbose:
+            print(f"Vocabulary: {vocab.size} words (max_words={max_words})")
+        return vocab

@@ -131,6 +131,48 @@ class BigramScorer:
         if not self._built:
             self._build_csr()
 
+    @classmethod
+    def build_from_nltk(
+        cls,
+        vocab: Vocabulary,
+        k: float = 0.5,
+        verbose: bool = True,
+    ) -> "BigramScorer":
+        """Build a bigram model from the NLTK Brown corpus."""
+        try:
+            import nltk
+        except ImportError:
+            raise ImportError("nltk is required: pip install nltk")
+
+        try:
+            nltk.data.find("corpora/brown")
+        except LookupError:
+            if verbose:
+                print("Downloading NLTK 'brown' corpus…")
+            nltk.download("brown", quiet=not verbose)
+
+        from nltk.corpus import brown
+
+        if verbose:
+            print("Training bigram model on Brown corpus…")
+
+        scorer = cls(vocab, k=k)
+        # Train sentence by sentence to respect sentence boundaries.
+        for sent in brown.sents():
+            ids = [vocab.word_to_id(w.lower()) for w in sent if w.isalpha()]
+            if len(ids) > 1:
+                scorer.train_on_ids(ids)
+
+        if verbose:
+            raw = scorer._raw_bigrams or {}
+            n_contexts = len(raw)
+            n_pairs = sum(len(v) for v in raw.values())
+            print(
+                f"Bigram model trained: {n_contexts} context words, "
+                f"{n_pairs} bigram types"
+            )
+        return scorer
+
     # ------------------------------------------------------------------
     # Scoring
     # ------------------------------------------------------------------

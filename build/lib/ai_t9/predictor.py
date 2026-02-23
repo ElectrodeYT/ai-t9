@@ -471,6 +471,40 @@ class T9Predictor:
         ngram = BigramScorer.load(ngram_path, vocab) if ngram_path else None
         return cls(dictionary, model=model, ngram=ngram, **kwargs)
 
+    @classmethod
+    def build_default(
+        cls,
+        max_words: int = 50_000,
+        verbose: bool = True,
+        with_ngram: bool = True,
+    ) -> "T9Predictor":
+        """Build a predictor from NLTK data with no pre-trained model.
+
+        This downloads the NLTK Brown corpus (~15 MB on first use) and builds
+        the vocabulary, dictionary, and optionally the bigram scorer in-memory.
+        No trained dual-encoder model is loaded; ranking uses frequency only
+        (+ bigram if with_ngram=True).
+
+        To add the neural model, train with DualEncoderTrainer and then
+        load with T9Predictor.from_files().
+        """
+        vocab = Vocabulary.build_from_nltk(max_words=max_words, verbose=verbose)
+        dictionary = T9Dictionary.build(vocab, verbose=verbose)
+
+        ngram = None
+        if with_ngram:
+            ngram = BigramScorer.build_from_nltk(vocab, verbose=verbose)
+
+        # With no model, only freq + ngram are active; adjust weights
+        return cls(
+            dictionary,
+            model=None,
+            ngram=ngram,
+            w_freq=0.5,
+            w_model=0.0,
+            w_ngram=0.5,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -1,31 +1,43 @@
-FROM python:3.11-slim
+# ai-t9 GPU trainer image
+#
+# Build:
+#   bash scripts/build_image.sh          # tags as ai-t9-trainer:latest
+#   docker build -t ai-t9-trainer:latest .
+#
+# Use with vast_orchestrate.py:
+#   python scripts/vast_orchestrate.py configs/vast-large.yaml \
+#       --image ai-t9-trainer:latest --install skip
+#
+# Push to a registry before using on Vast.ai:
+#   docker tag ai-t9-trainer:latest <registry>/<user>/ai-t9-trainer:latest
+#   docker push <registry>/<user>/ai-t9-trainer:latest
+#
+# The image is intentionally *not* pushed automatically. Build it locally
+# whenever the dependencies or source change, then push manually.
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    git \
+# ---- Base: PyTorch with CUDA -----------------------------------------------
+FROM pytorch/pytorch:2.5.0-cuda12.4-cudnn9-runtime
+
+# Minimal system packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
-WORKDIR /app
+WORKDIR /root
 
-# Copy project files
-COPY . /app
+# ---- Layer-caching trick: install all PyPI deps first ----------------------
+# Copy only the build metadata + a stub package so pip can resolve deps.
+# This layer is re-used on rebuilds unless pyproject.toml changes.
+COPY pyproject.toml README.md ./
+RUN mkdir -p src/ai_t9 \
+    && printf '__version__ = "0.0.0"\n' > src/ai_t9/__init__.py \
+    && pip install --no-cache-dir ".[train,data]" \
+    && pip uninstall -y ai-t9
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -e .[train,data,vast]
+# ---- Install the actual package --------------------------------------------
+COPY src/ src/
+RUN pip install --no-cache-dir --no-deps .
 
-# Create data directory
-RUN mkdir -p /data
-
-# Set environment variables for R2
-# These should be set when running the container
-# ENV R2_ACCESS_KEY_ID=...
-# ENV R2_SECRET_ACCESS_KEY=...
-# ENV R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com
-# ENV R2_BUCKET=ai-t9-data
-
-# Copy the training script
-COPY scripts/vast_train.py /app/vast_train.py
-
-# Default command
-CMD ["python", "/app/vast_train.py"]
+# ---- Entrypoint ------------------------------------------------------------
+# Pass a config path as CMD: docker run ai-t9-trainer /root/train_config.yaml
+ENTRYPOINT ["ai-t9-run"]

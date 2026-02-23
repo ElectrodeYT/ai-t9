@@ -343,18 +343,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.save_pairs:
             from ai_t9.model.trainer import (
                 _corpus_file_sentence_ids,
-                _brown_sentence_ids,
                 save_pairs,
             )
             print("Loading corpus for pair precomputation…")
             if hf_sentences is not None:
                 sentences = hf_sentences
-            elif corpus_files:
+            else:
+                assert corpus_files is not None  # Should always be set if not using HF dataset
                 sentences: list[list[int]] = []
                 for p in corpus_files:
                     sentences.extend(_corpus_file_sentence_ids(p, vocab))
-            else:
-                sentences = _brown_sentence_ids(vocab)
             pairs_out = Path(args.save_pairs)
             n = save_pairs(
                 sentences,

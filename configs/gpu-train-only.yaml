@@ -1,0 +1,67 @@
+# ai-t9 training — GPU-only config (train step only)
+#
+# Use this config on a remote GPU instance when vocab and pairs
+# have already been precomputed and uploaded to S3.
+#
+#   ai-t9-run configs/gpu-train-only.yaml
+#
+# The runner will auto-download vocab.json and pairs from S3.
+#
+# Required environment variables:
+#   AI_T9_S3_ENDPOINT, AI_T9_S3_BUCKET,
+#   AI_T9_S3_ACCESS_KEY, AI_T9_S3_SECRET_KEY
+
+name: "gpu-train-only"
+
+# No datasets needed — training uses precomputed pairs from S3
+datasets: []
+
+# ---------------------------------------------------------------------------
+# Model architecture (must match what was used to build vocab/pairs)
+# ---------------------------------------------------------------------------
+model:
+  embed_dim: 128
+  context_window: 3
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+training:
+  epochs: 10
+  lr: 0.001
+  weight_decay: 1e-4
+  warmup_frac: 0.05
+  min_lr_frac: 0.01
+  objective: "sgns"
+  n_negatives: 15
+  batch_size: 0
+  accumulate_grad_batches: 4
+  clip_grad_norm: 1.0
+  seed: 42
+  device: "auto"
+
+# ---------------------------------------------------------------------------
+# Only run the train step — vocab/pairs are downloaded from S3
+# ---------------------------------------------------------------------------
+output_dir: "data"
+ngram: false
+
+steps:
+  - train
+
+# ---------------------------------------------------------------------------
+# S3
+# ---------------------------------------------------------------------------
+s3:
+  endpoint:   "${AI_T9_S3_ENDPOINT}"
+  bucket:     "${AI_T9_S3_BUCKET}"
+  access_key: "${AI_T9_S3_ACCESS_KEY}"
+  secret_key: "${AI_T9_S3_SECRET_KEY}"
+  region:     "auto"
+  upload: true
+  paths:
+    vocab:  "vocab/vocab.json"
+    dict:   "vocab/dict.json"
+    pairs:  "pairs/"
+    model:  "models/model.npz"
+    ngram:  "ngrams/bigram.npz"

@@ -82,12 +82,16 @@ Training produces `model.npz` (DualEncoder embeddings) and optionally
 `bigram.json` (smoothed bigram counts). Requires the `[train]` extra.
 
 ```bash
-# Train on NLTK Brown corpus
+# Train on NLTK Brown corpus (SGNS objective, default)
 ai-t9-train --vocab data/vocab.json --output data/model.npz --save-ngram data/bigram.json
 
 # Train on a custom corpus
 ai-t9-train --vocab data/vocab.json --corpus corpuses/ --output data/model.npz \
             --save-ngram data/bigram.json --epochs 5 --embed-dim 64
+
+# Switch training objective to CLIP-style
+ai-t9-train --vocab data/vocab.json --output data/model.npz \
+            --objective clip --temperature 0.07
 ```
 
 Training options:
@@ -97,9 +101,11 @@ Training options:
 | `--epochs N` | 3 | Training epochs |
 | `--embed-dim N` | 64 | Embedding dimension |
 | `--context-window N` | 3 | Context words for the encoder |
-| `--neg-samples N` | 20 | Negatives per positive (frequency-weighted) |
-| `--lr F` | 0.005 | Learning rate |
-| `--batch-size N` | 2048 | Pairs per batch |
+| `--objective` | sgns | Training objective (`sgns` or `clip`) |
+| `--n-negatives N` | 15 | SGNS negatives per positive (frequency-weighted) |
+| `--temperature F` | 0.07 | CLIP softmax temperature (CLIP objective only) |
+| `--lr F` | 0.001 | Learning rate |
+| `--batch-size N` | auto | Pairs per batch (auto-detected from GPU/CPU) |
 | `--device` | auto | `cuda`, `mps`, or `cpu` |
 
 ### Precompute training pairs (optional)
@@ -282,8 +288,14 @@ ai-t9-data fetch-hf-local wikitext wikitext-103-raw-v1 train /data/corpuses/wiki
 - The **DualEncoder** model learns separate context and word embedding tables.
   At inference time, context word embeddings are mean-pooled and compared to
   candidate word embeddings via cosine similarity.
+- Training objectives are **pluggable** via `TrainingObjective` subclasses in
+  `src/ai_t9/model/objectives.py`.  The default objective is **SGNS**
+  (Skip-Gram Negative Sampling), which is O(B × k) per step — linear in batch
+  size.  A **CLIP**-style objective (O(B²)) is also available for comparison.
 - **Negative sampling** during training is frequency-weighted (Word2Vec-style
   $f^{0.75}$ distribution) for better rare-word representations.
+- L2 normalisation happens inside the model; SGNS works directly on cosine
+  similarities in [-1, 1] without a scale/temperature factor.
 - The `<unk>` token (ID 0) is excluded from training pairs and negative
   samples, preventing corpus noise from leaking into embeddings.
 

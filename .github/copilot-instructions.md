@@ -27,8 +27,13 @@
 - `BigramScorer` uses add-k smoothing (`k=0.5` default) and returns log-probabilities (`src/ai_t9/ngram.py`).
 
 ## Training conventions to preserve
+- The default training objective is **SGNS** (Skip-Gram Negative Sampling, Word2Vec / fastText style).  It is O(B × k) per step — linear in batch size — and a much better fit for this model's size (~830K params) than the old CLIP-style O(B²) objective.
+- Training objectives are **pluggable** via `TrainingObjective` subclasses in `src/ai_t9/model/objectives.py`.  The model forward pass returns `(ctx_vecs, pos_vecs)` and the objective computes the loss.  To add a new objective, subclass `TrainingObjective`, implement `compute_loss()`, and register it in the `OBJECTIVES` dict.
+- Objectives that need to embed extra word IDs (e.g. SGNS negatives) receive an `embed_fn` callback from the model — they do **not** import model internals.
+- Available objectives: `sgns` (default, k=15 negatives), `clip` (symmetric cross-entropy, temperature-scaled).
 - UNK tokens (ID 0) are **filtered out** of training sentence IDs in both corpus loaders (`_brown_sentence_ids`, `_corpus_file_sentence_ids`) and skipped as targets in `_precompute_pairs()`.
-- Negative sampling uses **frequency-weighted** distribution (`f^0.75`, Word2Vec-style) via `torch.multinomial`, not uniform `randint`.  UNK is excluded from negatives (weight=0).
+- Negative sampling (both SGNS negatives and the frequency-weighted distribution) uses `f^0.75` (Word2Vec-style) via `torch.multinomial`, not uniform `randint`.  UNK is excluded from negatives (weight=0).
+- L2 normalisation happens inside the model; SGNS works directly on cosine similarities in [-1, 1] without a scale/temperature factor (sigmoid has good gradient signal in this range).
 
 ## Developer workflows
 - Install base/dev deps: `pip install -e .` or `pip install -e ".[dev]"`.
@@ -40,6 +45,8 @@
 - Train model (PyTorch extra required):
   - `pip install -e ".[train]"`
   - `ai-t9-train --vocab data/vocab.json --output data/model.npz --save-ngram data/bigram.json`
+  - Switch objective: `ai-t9-train ... --objective clip --temperature 0.07`
+  - Tune negatives: `ai-t9-train ... --n-negatives 20`
 - Manual sanity run: `python examples/demo.py --vocab data/vocab.json --dict data/dict.json --model data/model.npz --ngram data/bigram.json`.
 - Always run tests and sanity checks after making changes, especially to core logic or data processing.
 

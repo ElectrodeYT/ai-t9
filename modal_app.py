@@ -94,6 +94,8 @@ DEFAULT_CONTEXT_WINDOW = 3
 DEFAULT_LR = 0.001
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_WARMUP_FRAC = 0.05
+DEFAULT_OBJECTIVE = "sgns"
+DEFAULT_N_NEGATIVES = 15
 DEFAULT_TEMPERATURE = 0.07
 DEFAULT_BATCH_SIZE = 8192
 DEFAULT_ACCUMULATE = 4          # effective batch = 8192 × 4 = 32768 on an A100
@@ -255,6 +257,8 @@ class Trainer:
         lr: float = DEFAULT_LR,
         weight_decay: float = DEFAULT_WEIGHT_DECAY,
         warmup_frac: float = DEFAULT_WARMUP_FRAC,
+        objective: str = DEFAULT_OBJECTIVE,
+        n_negatives: int = DEFAULT_N_NEGATIVES,
         temperature: float = DEFAULT_TEMPERATURE,
         batch_size: int = DEFAULT_BATCH_SIZE,
         accumulate_grad_batches: int = DEFAULT_ACCUMULATE,
@@ -313,6 +317,8 @@ class Trainer:
             "--lr", str(lr),
             "--weight-decay", str(weight_decay),
             "--warmup-frac", str(warmup_frac),
+            "--objective", str(objective),
+            "--n-negatives", str(n_negatives),
             "--temperature", str(temperature),
             "--batch-size", str(batch_size),
             "--accumulate-grad-batches", str(accumulate_grad_batches),
@@ -439,6 +445,8 @@ def main(
     lr: float = DEFAULT_LR,
     weight_decay: float = DEFAULT_WEIGHT_DECAY,
     warmup_frac: float = DEFAULT_WARMUP_FRAC,
+    objective: str = DEFAULT_OBJECTIVE,
+    n_negatives: int = DEFAULT_N_NEGATIVES,
     temperature: float = DEFAULT_TEMPERATURE,
     batch_size: int = DEFAULT_BATCH_SIZE,
     accumulate_grad_batches: int = DEFAULT_ACCUMULATE,
@@ -470,8 +478,9 @@ def main(
     Training flags are forwarded to ``ai-t9-train``:
 
       --epochs, --embed-dim, --context-window, --lr, --weight-decay,
-      --warmup-frac, --temperature, --batch-size, --accumulate-grad-batches,
-      --clip-grad-norm, --seed, --no-ngram
+      --warmup-frac, --objective, --n-negatives, --temperature,
+      --batch-size, --accumulate-grad-batches, --clip-grad-norm,
+      --seed, --no-ngram
 
     GPU selection:
 
@@ -531,6 +540,8 @@ def main(
             lr=lr,
             weight_decay=weight_decay,
             warmup_frac=warmup_frac,
+            objective=objective,
+            n_negatives=n_negatives,
             temperature=temperature,
             batch_size=batch_size,
             accumulate_grad_batches=accumulate_grad_batches,

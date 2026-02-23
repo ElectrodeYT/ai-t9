@@ -1,0 +1,82 @@
+# ai-t9 training run configuration — local development / baseline
+#
+# This config trains a small model from local corpus files.
+# Run:  ai-t9-run configs/default.yaml
+#
+# To skip building corpus/vocab/pairs when they already exist:
+#   ai-t9-run configs/default.yaml --step train
+
+name: "default"
+
+# ---------------------------------------------------------------------------
+# Datasets — combined into one corpus file during the 'corpus' step.
+# Supported types: local, huggingface, s3
+# ---------------------------------------------------------------------------
+datasets:
+  - type: local
+    path: "corpuses/"           # directory of *.txt files
+
+# ---------------------------------------------------------------------------
+# Dictionary — optional verified wordlist to filter T9 candidates.
+# Set to null (or remove) to use all vocabulary words.
+# ---------------------------------------------------------------------------
+dictionary: "tt9-dictionary/en-utf8.txt"
+
+# ---------------------------------------------------------------------------
+# Vocabulary
+# ---------------------------------------------------------------------------
+vocab:
+  max_words: 500_000
+  min_count: 20
+
+# ---------------------------------------------------------------------------
+# Model architecture
+# ---------------------------------------------------------------------------
+model:
+  embed_dim: 64
+  context_window: 3
+
+# ---------------------------------------------------------------------------
+# Training hyperparameters
+# ---------------------------------------------------------------------------
+training:
+  epochs: 500
+  lr: 0.001
+  weight_decay: 1e-4
+  warmup_frac: 0.05
+  min_lr_frac: 0.01
+  objective: "sgns"              # "sgns" (default, O(B×k)) or "clip" (O(B²))
+  n_negatives: 15                # negatives per positive (SGNS only)
+  # temperature: 0.07            # softmax temperature (CLIP only)
+  batch_size: 0                 # 0 = auto (picks based on GPU VRAM)
+  accumulate_grad_batches: 1
+  clip_grad_norm: 1.0
+  # seed: 42
+  device: "auto"
+  # checkpoint: "data/checkpoint.pth"   # uncomment to enable checkpointing
+
+# ---------------------------------------------------------------------------
+# Pair precomputation
+# ---------------------------------------------------------------------------
+pairs:
+  shard_size: 10_000_000        # null for single file (small corpora)
+
+# ---------------------------------------------------------------------------
+# Bigram model
+# ---------------------------------------------------------------------------
+ngram: true
+
+# ---------------------------------------------------------------------------
+# Output directory — all artifacts are written here
+# ---------------------------------------------------------------------------
+output_dir: "data"
+
+# ---------------------------------------------------------------------------
+# Pipeline steps — comment out steps you want to skip
+# ---------------------------------------------------------------------------
+steps:
+  - corpus
+  - vocab
+  - pairs
+  - train
+  - ngram

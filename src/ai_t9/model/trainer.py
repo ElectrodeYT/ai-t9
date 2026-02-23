@@ -1,22 +1,23 @@
-"""PyTorch training for the DualEncoder and CharNgramDualEncoder models.
+"""PyTorch training for the DualEncoder model.
 
 This module is intentionally isolated from the inference path — PyTorch is an
 optional dependency (pip install ai-t9[train]).  The output is a .npz file
 that the pure-NumPy encoders can load without any ML framework.
 
-Training objective: in-batch negative sampling (SimCLR / CLIP style)
-  For each (context_words, target_word) pair drawn from the corpus:
-    - Encode all contexts and targets in the batch → ctx_vecs, pos_vecs (B, dim)
-    - Compute a (B, B) similarity matrix: logits = ctx_vecs @ pos_vecs.T / temperature
-    - The diagonal entries are the correct (ctx_i, word_i) pairings
-    - Loss: symmetric cross-entropy over both rows and columns (CLIP-style):
-        (CE(logits, labels) + CE(logits.T, labels)) / 2
-      Each context identifies its target word AND each target identifies its
-      context, doubling gradient signal at no extra compute cost.
+Training objectives are pluggable (see ``objectives.py``):
 
-  This gives B-1 negatives per positive instead of the previous 20 fixed
-  negatives, providing ~200× more gradient signal at the same compute cost
-  when using large batches (B=4096+).
+  ``sgns``  (default) — Skip-Gram Negative Sampling (fastText / Word2Vec style)
+    For each (context_words, target_word) pair:
+      L = −log σ(c · w⁺) − (1/k) Σᵢ log σ(−c · wᵢ⁻)
+    Negatives are drawn from a frequency-weighted distribution (f^0.75).
+    Cost: O(B × k) per step — linear in batch size.
+
+  ``clip`` — CLIP-style in-batch negatives with symmetric cross-entropy
+    Builds a (B, B) similarity matrix; each context identifies its target and
+    vice versa.  Cost: O(B²) per step — quadratic in batch size.
+
+Custom objectives can be added by subclassing ``TrainingObjective`` in
+``objectives.py`` and passing an instance to ``DualEncoderTrainer``.
 
 Optimiser: AdamW with cosine LR decay and linear warmup.
 
@@ -38,6 +39,7 @@ import numpy as np
 
 from .vocab import Vocabulary
 from .dual_encoder import DualEncoder
+from .objectives import TrainingObjective
 
 
 def _require_torch():
@@ -78,90 +80,56 @@ def _resolve_device(torch, preference: str) -> "torch.device":
     return torch.device("cpu")
 
 
-def _auto_batch_size(torch, device) -> int:
-    """Pick a throughput-optimal power-of-2 batch size for in-batch negative contrastive training.
+def _auto_batch_size(
+    torch, device, objective: "TrainingObjective | None" = None,
+) -> int:
+    """Pick a throughput-optimal power-of-2 batch size.
 
-    Why VRAM alone is the wrong guide
-    ----------------------------------
-    In-batch negative contrastive training (SimCLR / CLIP style) materialises
-    a (B, B) similarity matrix every step.  Its cost breaks into two parts:
+    For linear-cost objectives (SGNS, the default), throughput scales linearly
+    with batch size so we use large batches.  For quadratic-cost objectives
+    (CLIP), the objective's :meth:`max_batch_size` caps the result to avoid
+    the O(B²) memory/compute cliff.
 
-        O(B² × d) FLOPs  — the ctx @ pos.T matmul
-        O(B²) memory BW  — the cross-entropy softmax over all B² elements
-
-    For the small embedding dimensions used here (d = 64–256), the softmax
-    term is memory-bandwidth-bound regardless of GPU tier, so throughput in
-    *pairs per second* degrades as O(1/B).  Maximising B to fill VRAM
-    therefore hurts wall-clock training speed without a proportional quality
-    gain: going from B=2048 to B=16384 (8×) makes each step 64× more
-    expensive while processing only 8× more pairs, for a net 8× slowdown.
-
-    Throughput cap (the binding constraint)
-    ----------------------------------------
-    The cap is set per GPU tier based on free VRAM at startup, which is a
-    reasonable proxy for GPU class:
-
-        ≥ 40 GiB free : 8192  (A100 / H100 — far higher TFLOPS sustain
-                                larger batches before the bandwidth cliff)
-        ≥ 12 GiB free : 4096  (high-end consumer: RTX 4080/4090, 3090, …)
-             default  : 2048  (mid-range consumer: ≤ 12 GiB free)
-
-    Literature (SimCLR, SimCSE, CLIP) identifies B=2048–4096 as the quality/
-    throughput sweet spot: enough in-batch negatives for strong embeddings,
-    small enough that O(B²) compute does not dominate training time.
-
-    VRAM safety bound (secondary constraint)
-    -----------------------------------------
-    The logits peak (8 bytes × B²) must not exceed 25% of free VRAM:
-
-        8 bytes × B²  (2 BF16 logits + 2 BF16 grad + 4 FP32 softmax)
-
-    This is almost never the binding constraint for the typical embedding
-    model (V≈50k, d≤256), but prevents OOM on very memory-constrained devices.
-    The remaining 75% covers model weights, AdamW state, training data arrays,
-    and CUDA / PyTorch overhead.
-
-    Falls back to 2048 on non-CUDA devices.
+    Falls back to 4096 on non-CUDA devices.
     """
     if not (str(device).startswith("cuda") and torch.cuda.is_available()):
-        return 2048
+        return 4096
 
     try:
         free, _total = torch.cuda.mem_get_info(device)
     except AttributeError:
         free = torch.cuda.get_device_properties(device).total_memory
 
-    # ---- Throughput cap (primary) ------------------------------------------
-    # Tiered by free VRAM as a GPU-class proxy; prevents the O(1/B) throughput
-    # cliff that occurs when the logits matmul becomes the dominant cost.
     free_gib = free / 1024 ** 3
     if free_gib >= 40:
-        throughput_cap = 8192   # data-centre (A100 / H100)
+        cap = 32768     # data-centre (A100 / H100)
     elif free_gib >= 12:
-        throughput_cap = 4096   # high-end consumer (RTX 4080+, 3090, …)
+        cap = 16384     # high-end consumer (RTX 4080+, 3090, …)
     else:
-        throughput_cap = 2048   # mid-range consumer
+        cap = 8192      # mid-range consumer
 
-    # ---- VRAM safety bound (secondary) ------------------------------------
-    # Logits peak must fit in 25% of free VRAM.
-    _BYTES_PER_ELEM = 8   # BF16 logits(2) + BF16 grad(2) + FP32 softmax(4)
-    vram_max_b = int(math.sqrt(free * 0.25 / _BYTES_PER_ELEM))
+    # Let the objective impose its own VRAM-based limit (e.g. CLIP's O(B²)).
+    if objective is not None:
+        obj_max = objective.max_batch_size(free)
+        if obj_max is not None:
+            cap = min(cap, obj_max)
 
-    max_b = min(vram_max_b, throughput_cap)
-
-    if max_b < 2048:
+    if cap < 2048:
         return 2048
-    batch_size = 1 << int(math.log2(max_b))
-    return min(batch_size, 131072)
+    return 1 << int(math.log2(cap))
 
 
 def _resolve_batch_size(
-    batch_size: int, torch, device, verbose: bool = False,
+    batch_size: int,
+    torch,
+    device,
+    objective: "TrainingObjective | None" = None,
+    verbose: bool = False,
 ) -> int:
     """Return *batch_size* unchanged if positive, otherwise auto-detect."""
     if batch_size > 0:
         return batch_size
-    auto = _auto_batch_size(torch, device)
+    auto = _auto_batch_size(torch, device, objective=objective)
     if verbose:
         print(f"  Auto batch size: {auto:,}")
     return auto
@@ -434,7 +402,6 @@ class _BaseTrainer:
         weight_decay: float = 1e-4,
         warmup_frac: float = 0.05,
         min_lr_frac: float = 0.01,
-        temperature: float = 0.07,
         batch_size: int = 0,
         accumulate_grad_batches: int = 1,
         clip_grad_norm: float = 1.0,
@@ -449,7 +416,6 @@ class _BaseTrainer:
         self._weight_decay = weight_decay
         self._warmup_frac = warmup_frac
         self._min_lr_frac = min_lr_frac
-        self._temperature = temperature
         self._batch_size = batch_size
         self._accumulate = max(1, accumulate_grad_batches)
         self._clip_grad_norm = clip_grad_norm
@@ -462,6 +428,7 @@ class _BaseTrainer:
         self._optimizer = None
         self._scheduler = None
         self._scaler = None
+        self._objective: TrainingObjective | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -614,12 +581,25 @@ class _BaseTrainer:
         except ImportError:
             _tqdm = None
 
+        assert self._objective is not None, (
+            "Training objective not set — subclass must build it in _before_training()"
+        )
+
         device, is_cuda, amp_dtype, scaler = self._setup_device_and_amp(torch)
-        self._batch_size = _resolve_batch_size(self._batch_size, torch, device, verbose=verbose)
+        self._objective.setup(device)
+        self._batch_size = _resolve_batch_size(
+            self._batch_size, torch, device,
+            objective=self._objective, verbose=verbose,
+        )
 
         model, compiled = self._build_model(torch, device)
         self._model = model
         model.train()
+
+        # embed_fn for objectives that need to embed extra word IDs (e.g. SGNS
+        # negative sampling).  Uses the *uncompiled* model so the call works
+        # regardless of torch.compile graph boundaries.
+        embed_fn = getattr(model, 'embed_tgt_words', None)
 
         # Load checkpoint if available
         if hasattr(self, '_checkpoint_data') and self._checkpoint_data:
@@ -632,13 +612,11 @@ class _BaseTrainer:
         effective_batch = self._batch_size * self._accumulate
         total_steps = math.ceil(n_batches / self._accumulate) * epochs
         warmup_steps = int(total_steps * self._warmup_frac)
-        temperature = self._temperature
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=self._lr, weight_decay=self._weight_decay)
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer, _make_lr_lambda(total_steps, warmup_steps, self._min_lr_frac)
         )
-        ce_loss = torch.nn.CrossEntropyLoss()
 
         self._optimizer = optimizer
         self._scheduler = scheduler
@@ -671,15 +649,11 @@ class _BaseTrainer:
             print(
                 f"Device: {device}  |  pairs: {n_pairs:,}  |  "
                 f"vocab: {self._vocab.size}  |  embed_dim: {self._embed_dim}"
-                f"{extra_str}  |  temperature: {temperature}  |  "
+                f"{extra_str}  |  objective: {self._objective.label}  |  "
                 f"batch: {self._batch_size}  |  accumulate: {self._accumulate}  |  "
                 f"effective_batch: {effective_batch}  |  "
                 f"torch.compile: {compiled_str}  |  amp: {amp_str}  |  {mem_str}"
             )
-
-        # Pre-allocate labels once — drop-last batching guarantees every batch
-        # is exactly batch_size, so no slicing is needed in the hot loop.
-        labels = torch.arange(self._batch_size, device=device)
 
         t_train = time.monotonic()
         global_step = self._global_step
@@ -712,8 +686,10 @@ class _BaseTrainer:
                     torch.compiler.cudagraph_mark_step_begin()
                 with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                     enabled=amp_dtype is not None):
-                    logits = compiled(ctx_dev[idx], pos_dev[idx])
-                    loss = (ce_loss(logits, labels) + ce_loss(logits.T, labels)) / 2 / self._accumulate
+                    ctx_vecs, pos_vecs = compiled(ctx_dev[idx], pos_dev[idx])
+                    loss = self._objective.compute_loss(
+                        ctx_vecs, pos_vecs, embed_fn=embed_fn,
+                    ) / self._accumulate
 
                 if scaler is not None:
                     scaler.scale(loss).backward()
@@ -763,12 +739,19 @@ class _BaseTrainer:
 
     def _train_from_shards(self, shard_paths, epochs, torch, prefetch, verbose):
         """Epoch loop over sharded pairs files with optional prefetch."""
+        assert self._objective is not None
+
         device, is_cuda, amp_dtype, scaler = self._setup_device_and_amp(torch)
-        self._batch_size = _resolve_batch_size(self._batch_size, torch, device, verbose=verbose)
+        self._objective.setup(device)
+        self._batch_size = _resolve_batch_size(
+            self._batch_size, torch, device,
+            objective=self._objective, verbose=verbose,
+        )
 
         model, compiled = self._build_model(torch, device)
         self._model = model
         model.train()
+        embed_fn = getattr(model, 'embed_tgt_words', None)
 
         # Estimate total steps from the first shard.
         first_ctx, first_pos = load_pairs(
@@ -782,7 +765,6 @@ class _BaseTrainer:
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer, _make_lr_lambda(total_steps, warmup_steps, self._min_lr_frac)
         )
-        ce_loss = torch.nn.CrossEntropyLoss()
 
         t_train = time.monotonic()
         global_step = 0
@@ -818,8 +800,8 @@ class _BaseTrainer:
                     prefetch_thread = None
 
                 sl, sb, global_step = self._train_shard_core(
-                    ctx_np, pos_np, compiled, optimizer, scheduler, ce_loss,
-                    device, global_step, amp_dtype, scaler,
+                    ctx_np, pos_np, compiled, optimizer, scheduler,
+                    device, global_step, amp_dtype, scaler, embed_fn,
                 )
                 epoch_loss += sl
                 epoch_batches += sb
@@ -831,8 +813,8 @@ class _BaseTrainer:
             _log_training_complete(t_train)
 
     def _train_shard_core(
-        self, ctx_np, pos_np, compiled, optimizer, scheduler, ce_loss,
-        device, global_step, amp_dtype, scaler,
+        self, ctx_np, pos_np, compiled, optimizer, scheduler,
+        device, global_step, amp_dtype, scaler, embed_fn,
     ):
         """Train one shard of pairs. Returns (loss_float, n_batches, global_step)."""
         import torch
@@ -848,7 +830,6 @@ class _BaseTrainer:
         n_pairs = len(pos_np)
         n_batches = n_pairs // self._batch_size
         perm = torch.randperm(n_pairs, device=device)
-        labels = torch.arange(self._batch_size, device=device)
         running_loss = torch.zeros(1, device=device)
         optimizer.zero_grad(set_to_none=True)
 
@@ -859,8 +840,10 @@ class _BaseTrainer:
             if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                 torch.compiler.cudagraph_mark_step_begin()
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                logits = compiled(ctx_dev[idx], pos_dev[idx])
-                loss = (ce_loss(logits, labels) + ce_loss(logits.T, labels)) / 2 / self._accumulate
+                ctx_vecs, pos_vecs = compiled(ctx_dev[idx], pos_dev[idx])
+                loss = self._objective.compute_loss(
+                    ctx_vecs, pos_vecs, embed_fn=embed_fn,
+                ) / self._accumulate
 
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -897,11 +880,18 @@ class _BaseTrainer:
 # ---------------------------------------------------------------------------
 
 class DualEncoderTrainer(_BaseTrainer):
-    """Train a DualEncoder using in-batch negative sampling.
+    """Train a DualEncoder using pluggable training objectives.
 
-    The training data pipeline uses (context_word_ids, target_word_id) pairs,
-    with in-batch negatives and cross-entropy loss.  Words are represented as
-    mean-pooled character n-gram embeddings, decoupling model size from vocab size.
+    The training data pipeline uses (context_word_ids, target_word_id) pairs.
+    Words are represented as mean-pooled character n-gram embeddings,
+    decoupling model size from vocab size.
+
+    The training objective is configurable:
+
+    - ``"sgns"`` (default): Skip-Gram Negative Sampling — O(B×k), fast and
+      well-suited for word embedding quality.
+    - ``"clip"``: CLIP-style in-batch negatives — O(B²), useful for research.
+    - Any :class:`TrainingObjective` instance for custom objectives.
 
     Usage::
 
@@ -919,7 +909,6 @@ class DualEncoderTrainer(_BaseTrainer):
         weight_decay: float = 1e-4,
         warmup_frac: float = 0.05,
         min_lr_frac: float = 0.01,
-        temperature: float = 0.07,
         batch_size: int = 0,
         accumulate_grad_batches: int = 1,
         clip_grad_norm: float = 1.0,
@@ -927,14 +916,20 @@ class DualEncoderTrainer(_BaseTrainer):
         device: str = "auto",
         debug: bool = False,
         ns: tuple[int, ...] = (2, 3),
+        objective: str | TrainingObjective = "sgns",
+        n_negatives: int = 15,
+        temperature: float = 0.07,
     ) -> None:
         super().__init__(
             vocab, embed_dim, context_window, lr, weight_decay, warmup_frac,
-            min_lr_frac, temperature, batch_size, accumulate_grad_batches,
+            min_lr_frac, batch_size, accumulate_grad_batches,
             clip_grad_norm, seed, device, debug,
         )
         self._ns = ns
         self._ngram_to_id: dict[str, int] | None = None
+        self._objective_spec = objective
+        self._n_negatives = n_negatives
+        self._temperature = temperature
 
     # ------------------------------------------------------------------
     # Hooks
@@ -942,11 +937,38 @@ class DualEncoderTrainer(_BaseTrainer):
 
     def _before_training(self) -> None:
         self._build_ngram_vocab_if_needed()
+        self._build_objective_if_needed()
 
     def _verbose_extra_fields(self) -> dict[str, object]:
         if self._ngram_to_id is None:
             return {}
         return {"n_ngrams": len(self._ngram_to_id) + 1}
+
+    # ------------------------------------------------------------------
+    # Objective building
+    # ------------------------------------------------------------------
+
+    def _build_objective_if_needed(self) -> None:
+        """Construct the training objective from ``self._objective_spec``."""
+        if self._objective is not None:
+            return
+        from .objectives import SGNSObjective, CLIPObjective, OBJECTIVES
+
+        spec = self._objective_spec
+        if isinstance(spec, TrainingObjective):
+            self._objective = spec
+        elif spec == "sgns":
+            self._objective = SGNSObjective(
+                counts=self._vocab._counts,
+                k=self._n_negatives,
+            )
+        elif spec == "clip":
+            self._objective = CLIPObjective(temperature=self._temperature)
+        else:
+            raise ValueError(
+                f"Unknown objective: {spec!r}. "
+                f"Available: {list(OBJECTIVES)}"
+            )
 
     # ------------------------------------------------------------------
     # N-gram vocabulary helpers
@@ -993,7 +1015,6 @@ class DualEncoderTrainer(_BaseTrainer):
         vocab_size = self._vocab.size
         embed_dim = self._embed_dim
         n_ngrams = len(self._ngram_to_id) + 1
-        temperature = self._temperature
 
         ngram_table, ngram_counts = self._build_word_ngram_table(torch)
         ngram_table = ngram_table.to(device)
@@ -1023,6 +1044,15 @@ class DualEncoderTrainer(_BaseTrainer):
                 summed = vecs.sum(dim=1)                      # (n, dim)
                 return F.normalize(summed / counts, dim=-1)   # (n, dim)
 
+            def embed_tgt_words(self_, word_ids):
+                """Embed word IDs through the target (word) embedding table.
+
+                This is used by objectives that need to score additional words
+                (e.g. SGNS negative sampling).  Uses the same n-gram mean-pool
+                + L2-normalise path as the forward pass.
+                """
+                return self_._embed_words(self_.wrd_embed, word_ids)
+
             def forward(self_, ctx_ids, pos_ids):
                 F = torch.nn.functional
                 batch = ctx_ids.size(0)
@@ -1037,8 +1067,7 @@ class DualEncoderTrainer(_BaseTrainer):
                 # Positive: embed target words, normalise.
                 pos_vecs = self_._embed_words(self_.wrd_embed, pos_ids)  # (batch, dim)
 
-                # (batch, batch) similarity matrix; diagonal = correct pairs.
-                return ctx_vecs @ pos_vecs.T / temperature
+                return ctx_vecs, pos_vecs
 
         model = _CharNgramModel().to(device)
         compiled = model

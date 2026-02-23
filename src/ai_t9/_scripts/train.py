@@ -219,7 +219,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--weight-decay",   type=float, default=1e-4,  help="AdamW weight decay (default: 1e-4)")
     parser.add_argument("--warmup-frac",    type=float, default=0.05,  help="Fraction of steps used for linear LR warmup (default: 0.05)")
     parser.add_argument("--min-lr-frac",    type=float, default=0.01,  help="Cosine decay floor as fraction of peak LR (default: 0.01)")
-    parser.add_argument("--temperature",    type=float, default=0.07,  help="In-batch negative softmax temperature (default: 0.07)")
+    parser.add_argument("--temperature",    type=float, default=0.07,  help="Softmax temperature (CLIP objective only, default: 0.07)")
+
+    # ---- Objective -------------------------------------------------------
+    parser.add_argument(
+        "--objective",
+        default="sgns",
+        choices=["sgns", "clip"],
+        help="Training objective: 'sgns' (Skip-Gram Negative Sampling, default) "
+             "or 'clip' (in-batch negatives, O(B²))",
+    )
+    parser.add_argument("--n-negatives",    type=int,   default=15,    help="Negative samples per positive for SGNS objective (default: 15)")
 
     # ---- Batch / accumulation -------------------------------------------
     parser.add_argument("--batch-size",             type=int,   default=0,    help="Pairs per micro-batch. 0 (default) auto-selects based on GPU VRAM; typical auto values are 16384\u2013131072.")
@@ -294,13 +304,15 @@ def main(argv: list[str] | None = None) -> int:
         weight_decay=args.weight_decay,
         warmup_frac=args.warmup_frac,
         min_lr_frac=args.min_lr_frac,
-        temperature=args.temperature,
         batch_size=args.batch_size,
         accumulate_grad_batches=args.accumulate_grad_batches,
         clip_grad_norm=args.clip_grad_norm,
         seed=args.seed,
         device=args.device,
         debug=args.debug,
+        objective=args.objective,
+        n_negatives=args.n_negatives,
+        temperature=args.temperature,
     )
 
     # Load checkpoint if exists

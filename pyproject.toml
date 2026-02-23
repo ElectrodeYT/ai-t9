@@ -13,6 +13,7 @@ dependencies = [
     "nltk>=3.8",
     "datasets>=2.0",
     "hf-transfer>=0.1.8",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +27,7 @@ vast  = ["paramiko>=3.0"]
 ai-t9-build-vocab = "ai_t9._scripts.build_vocab:main"
 ai-t9-train       = "ai_t9._scripts.train:main"
 ai-t9-data        = "ai_t9._scripts.data:main"
+ai-t9-run         = "ai_t9._scripts.run:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

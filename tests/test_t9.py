@@ -1183,7 +1183,6 @@ class TestDualEncoderTrainerSmoke:
             vocab=tiny_vocab,
             embed_dim=8,
             context_window=2,
-            temperature=0.07,
             batch_size=4,   # tiny batch for fast test
             accumulate_grad_batches=1,
             seed=0,
@@ -1265,7 +1264,6 @@ class TestCharNgramTrainerSmoke:
             vocab=tiny_vocab,
             embed_dim=8,
             context_window=2,
-            temperature=0.07,
             batch_size=4,
             seed=0,
             device="cpu",

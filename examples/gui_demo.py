@@ -1566,7 +1566,7 @@ class T9PhoneWindow(QMainWindow):
                         context=self._session.context,
                         top_k=self._top_k,
                         trace=True,
-                        completions=True
+                        completions=False,
                     )
                 )
             except ValueError:

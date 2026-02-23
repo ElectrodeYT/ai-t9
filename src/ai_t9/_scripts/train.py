@@ -2,10 +2,7 @@
 
 Usage::
 
-    # Train on NLTK Brown corpus (default)
-    ai-t9-train --vocab data/vocab.json --output data/model.npz
-
-    # Train on a single corpus file
+    # Train on a corpus file
     ai-t9-train --vocab data/vocab.json --corpus mytext.txt --output data/model.npz \\
                 --epochs 5 --embed-dim 64 --temperature 0.07
 
@@ -57,6 +54,50 @@ def _resolve_corpus_files(corpus_path: Path) -> list[Path] | None:
     return None
 
 
+def _load_hf_texts(args) -> list[str]:
+    """Load texts from HuggingFace dataset."""
+    from datasets import load_dataset
+    
+    print(f"Loading HuggingFace dataset: {args.hf_dataset}")
+    if args.hf_config:
+        print(f"  Config: {args.hf_config}")
+    print(f"  Split: {args.hf_split}")
+    print(f"  Column: {args.hf_column}")
+    print(f"  Streaming: {args.hf_streaming}")
+    
+    dataset = load_dataset(
+        args.hf_dataset,
+        args.hf_config,
+        split=args.hf_split,
+        streaming=args.hf_streaming,
+    )
+    
+    if args.hf_streaming:
+        # For streaming, collect all texts (may not work for very large datasets)
+        texts = [item[args.hf_column] for item in dataset]
+    else:
+        texts = dataset[args.hf_column]
+    
+    print(f"  Loaded {len(texts)} texts")
+    return texts
+
+
+def _hf_sentence_ids(texts: list[str], vocab) -> list[list[int]]:
+    """Convert list of texts to list of sentence ID lists."""
+    from nltk.tokenize import sent_tokenize
+    
+    sentences = []
+    for text in texts:
+        for sent in sent_tokenize(text):
+            words = sent.lower().split()
+            ids = vocab.words_to_ids(words)
+            if ids:  # Skip empty sentences
+                sentences.append(ids)
+    
+    print(f"  Extracted {len(sentences)} sentences")
+    return sentences
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Train ai-t9 DualEncoder model"
@@ -74,7 +115,36 @@ def main(argv: list[str] | None = None) -> int:
         metavar="FILE_OR_DIR",
         default=None,
         help="Plain-text corpus file, or a directory of *.txt files whose "
-             "sentences are combined. Defaults to NLTK Brown corpus.",
+             "sentences are combined. Required unless --hf-dataset is used.",
+    )
+    parser.add_argument(
+        "--hf-dataset",
+        metavar="NAME_OR_PATH",
+        default=None,
+        help="HuggingFace dataset name, path, or URL (e.g., 'bookcorpus', 's3://bucket/data', 'parquet_file.parquet')",
+    )
+    parser.add_argument(
+        "--hf-config",
+        metavar="CONFIG",
+        default=None,
+        help="Dataset configuration name",
+    )
+    parser.add_argument(
+        "--hf-split",
+        metavar="SPLIT",
+        default="train",
+        help="Dataset split to use (default: train)",
+    )
+    parser.add_argument(
+        "--hf-column",
+        metavar="COLUMN",
+        default="text",
+        help="Name of the text column in the dataset (default: text)",
+    )
+    parser.add_argument(
+        "--hf-streaming",
+        action="store_true",
+        help="Use streaming mode for large datasets (requires --save-pairs)",
     )
     parser.add_argument(
         "--output",
@@ -174,17 +244,21 @@ def main(argv: list[str] | None = None) -> int:
     TrainerCls = DualEncoderTrainer
 
     # ---- Validate flag combinations ------------------------------------
-    if args.pairs_only and not args.save_pairs:
-        print("ERROR: --pairs-only requires --save-pairs", file=sys.stderr)
+    if args.hf_streaming and not args.save_pairs:
+        print("ERROR: --hf-streaming requires --save-pairs for precomputing pairs", file=sys.stderr)
         return 1
 
     input_sources = sum([
         bool(args.load_pairs),
         bool(args.pairs_dir),
         bool(args.corpus),
+        bool(args.hf_dataset),
     ])
     if input_sources > 1:
-        print("ERROR: --load-pairs, --pairs-dir, and --corpus are mutually exclusive", file=sys.stderr)
+        print("ERROR: --load-pairs, --pairs-dir, --corpus, and --hf-dataset are mutually exclusive", file=sys.stderr)
+        return 1
+    if input_sources == 0:
+        print("ERROR: Must specify one of --corpus, --hf-dataset, --load-pairs, or --pairs-dir", file=sys.stderr)
         return 1
     if args.load_pairs and args.pairs_only:
         print("ERROR: --load-pairs and --pairs-only are mutually exclusive", file=sys.stderr)
@@ -234,6 +308,7 @@ def main(argv: list[str] | None = None) -> int:
     # corpus_files may be set below; initialize here so the bigram section can
     # always reference it regardless of which training path was taken.
     corpus_files = None
+    hf_sentences = None
 
     if args.pairs_dir:
         # Sharded-directory path: shuffle shards each epoch, optional prefetch.
@@ -257,6 +332,9 @@ def main(argv: list[str] | None = None) -> int:
             corpus_files = _resolve_corpus_files(Path(args.corpus))
             if corpus_files is None:
                 return 1
+        elif args.hf_dataset:
+            texts = _load_hf_texts(args)
+            hf_sentences = _hf_sentence_ids(texts, vocab)
 
         if args.save_pairs:
             from ai_t9.model.trainer import (
@@ -265,7 +343,9 @@ def main(argv: list[str] | None = None) -> int:
                 save_pairs,
             )
             print("Loading corpus for pair precomputation…")
-            if corpus_files:
+            if hf_sentences is not None:
+                sentences = hf_sentences
+            elif corpus_files:
                 sentences: list[list[int]] = []
                 for p in corpus_files:
                     sentences.extend(_corpus_file_sentence_ids(p, vocab))
@@ -287,10 +367,14 @@ def main(argv: list[str] | None = None) -> int:
             resolved = pairs_out if str(pairs_out).endswith(".npz") else Path(str(pairs_out) + ".npz")
             trainer.train_from_pairs_file(resolved, epochs=args.epochs, verbose=True, checkpoint_path=args.checkpoint)
 
+        elif hf_sentences is not None:
+            trainer.train_from_sentences(hf_sentences, epochs=args.epochs, verbose=True, checkpoint_path=args.checkpoint)
         elif corpus_files:
-            trainer.train_from_files(corpus_files, epochs=args.epochs, verbose=True)
+            trainer.train_from_files(corpus_files, epochs=args.epochs, verbose=True, checkpoint_path=args.checkpoint)
         else:
-            trainer.train_from_nltk(epochs=args.epochs, verbose=True)
+            # This should never happen due to input validation above
+            print("ERROR: No training data source specified", file=sys.stderr)
+            return 1
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,14 +385,14 @@ def main(argv: list[str] | None = None) -> int:
         from ai_t9.ngram import BigramScorer
         from ai_t9.model.trainer import _corpus_file_sentence_ids
         print("Training bigram model…")
-        if corpus_files:
-            scorer = BigramScorer(vocab)
-            for path in corpus_files:
-                sents = _corpus_file_sentence_ids(path, vocab)
-                for sent in sents:
-                    scorer.train_on_ids(sent)
-        else:
-            scorer = BigramScorer.build_from_nltk(vocab, verbose=True)
+        if not corpus_files:
+            print("ERROR: --save-ngram requires --corpus to be specified", file=sys.stderr)
+            return 1
+        scorer = BigramScorer(vocab)
+        for path in corpus_files:
+            sents = _corpus_file_sentence_ids(path, vocab)
+            for sent in sents:
+                scorer.train_on_ids(sent)
         ngram_path = Path(args.save_ngram)
         ngram_path.parent.mkdir(parents=True, exist_ok=True)
         actual_ngram_path = scorer.save(ngram_path)

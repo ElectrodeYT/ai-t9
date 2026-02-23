@@ -171,8 +171,8 @@ else
         s3_sync_from "${CORPUS_REMOTE}" corpus/
         CORPUS_ARG="--corpus corpus/"
     else
-        log "No CORPUS_REMOTE set; using NLTK Brown corpus for pairs"
-        CORPUS_ARG=""
+        log "ERROR: CORPUS_REMOTE must be set (NLTK Brown corpus no longer supported)"
+        exit 1
     fi
 
     mkdir -p pairs

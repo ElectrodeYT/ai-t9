@@ -2,10 +2,7 @@
 
 Usage::
 
-    # From NLTK Brown corpus (default)
-    ai-t9-build-vocab --output data/
-
-    # From a single corpus file
+    # From a corpus file
     ai-t9-build-vocab --corpus corpuses/mytext.txt --output data/
 
     # From a folder of corpus files (all *.txt files are combined)
@@ -59,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
         metavar="FILE_OR_DIR",
         default=None,
         help="Plain-text corpus file, or a directory of *.txt files whose "
-             "word counts are combined. Defaults to NLTK Brown corpus.",
+             "word counts are combined. Required.",
     )
     parser.add_argument(
         "--output",
@@ -101,26 +98,25 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Build vocabulary -------------------------------------------------
-    if args.corpus:
-        corpus_path = Path(args.corpus)
-        try:
-            files = _resolve_corpus_files(corpus_path)
-        except FileNotFoundError as e:
-            print(f"ERROR: {e}", file=sys.stderr)
-            return 1
+    if not args.corpus:
+        print("ERROR: --corpus is required", file=sys.stderr)
+        return 1
+        
+    corpus_path = Path(args.corpus)
+    try:
+        files = _resolve_corpus_files(corpus_path)
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
 
-        counter: Counter = Counter()
-        for path in files:
-            lines = _count_words_from_file(path, counter, verbose=True)
-            print(f"  {path.name}: {lines:,} lines  ({sum(counter.values()):,} words so far)")
+    counter: Counter = Counter()
+    for path in files:
+        lines = _count_words_from_file(path, counter, verbose=True)
+        print(f"  {path.name}: {lines:,} lines  ({sum(counter.values()):,} words so far)")
 
-        vocab = Vocabulary.build_from_counts(
-            counter, max_words=args.max_words, min_count=args.min_count
-        )
-    else:
-        vocab = Vocabulary.build_from_nltk(
-            max_words=args.max_words, min_count=args.min_count, verbose=True
-        )
+    vocab = Vocabulary.build_from_counts(
+        counter, max_words=args.max_words, min_count=args.min_count
+    )
 
     vocab_path = out_dir / "vocab.json"
     vocab.save(vocab_path)

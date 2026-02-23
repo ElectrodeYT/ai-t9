@@ -171,28 +171,6 @@ def _resolve_batch_size(
 # Corpus iterator helpers
 # ---------------------------------------------------------------------------
 
-def _brown_sentence_ids(vocab: Vocabulary) -> list[list[int]]:
-    """Return all Brown corpus sentences as lists of word IDs.
-
-    UNK tokens (ID 0) are excluded so they never appear as training
-    targets or pollute context windows.
-    """
-    import nltk
-    try:
-        nltk.data.find("corpora/brown")
-    except LookupError:
-        nltk.download("brown", quiet=True)
-    from nltk.corpus import brown
-    sentences = []
-    unk = vocab.UNK_ID
-    for sent in brown.sents():
-        ids = [vocab.word_to_id(w.lower()) for w in sent if w.isalpha()]
-        ids = [wid for wid in ids if wid != unk]
-        if len(ids) >= 2:
-            sentences.append(ids)
-    return sentences
-
-
 def _corpus_file_sentence_ids(path: Path, vocab: Vocabulary) -> list[list[int]]:
     """Read a plain-text file (one sentence per line) and convert to word IDs.
 
@@ -489,22 +467,17 @@ class _BaseTrainer:
     # Public API
     # ------------------------------------------------------------------
 
-    def train_from_nltk(self, epochs: int = 3, verbose: bool = True, checkpoint_path: str | Path | None = None) -> None:
-        """Train on the NLTK Brown corpus (auto-downloaded)."""
+    def train_from_sentences(self, sentences: list[list[int]], epochs: int = 3, verbose: bool = True, checkpoint_path: str | Path | None = None) -> None:
+        """Train from a list of sentences (list of word ID lists)."""
         torch = _require_torch()
-        t0 = time.monotonic()
-        if verbose:
-            print("Loading Brown corpus…")
-        sentences = _brown_sentence_ids(self._vocab)
-        if verbose:
-            print(f"  {len(sentences):,} sentences loaded  ({time.monotonic()-t0:.2f}s)")
-        self._train(sentences, epochs=epochs, torch=torch, verbose=verbose)
+        self._before_training()
+        self._train(sentences, epochs=epochs, torch=torch, verbose=verbose, checkpoint_path=checkpoint_path)
 
-    def train_from_file(self, corpus_path: str | Path, epochs: int = 3, verbose: bool = True) -> None:
+    def train_from_file(self, corpus_path: str | Path, epochs: int = 3, verbose: bool = True, checkpoint_path: str | Path | None = None) -> None:
         """Train on a plain-text file (one sentence per line)."""
-        self.train_from_files([Path(corpus_path)], epochs=epochs, verbose=verbose)
+        self.train_from_files([Path(corpus_path)], epochs=epochs, verbose=verbose, checkpoint_path=checkpoint_path)
 
-    def train_from_files(self, paths: list[str | Path], epochs: int = 3, verbose: bool = True) -> None:
+    def train_from_files(self, paths: list[str | Path], epochs: int = 3, verbose: bool = True, checkpoint_path: str | Path | None = None) -> None:
         """Train on multiple plain-text corpus files (combined into one pass)."""
         torch = _require_torch()
         t0 = time.monotonic()
@@ -523,7 +496,8 @@ class _BaseTrainer:
         if verbose:
             print()
             print(f"  Total: {len(sentences):,} sentences")
-        self._train(sentences, epochs=epochs, torch=torch, verbose=verbose)
+        self._before_training()
+        self._train(sentences, epochs=epochs, torch=torch, verbose=verbose, checkpoint_path=checkpoint_path)
 
     def train_from_pairs_file(self, pairs_path: str | Path, epochs: int = 3, verbose: bool = True, checkpoint_path: str | Path | None = None) -> None:
         """Train directly from a precomputed pairs .npz file."""
@@ -602,10 +576,10 @@ class _BaseTrainer:
     # Internal training
     # ------------------------------------------------------------------
 
-    def _train(self, sentences, epochs, torch, verbose):
+    def _train(self, sentences, epochs, torch, verbose, checkpoint_path=None):
         ctx_np, pos_np = _precompute_pairs(sentences, self._context_window, verbose=verbose)
         self._before_training()
-        self._train_from_arrays(ctx_np, pos_np, epochs=epochs, torch=torch, verbose=verbose)
+        self._train_from_arrays(ctx_np, pos_np, epochs=epochs, torch=torch, verbose=verbose, checkpoint_path=checkpoint_path)
 
     def _setup_device_and_amp(self, torch):
         """Set up device, CUDA optimisations, and AMP dtype/scaler.

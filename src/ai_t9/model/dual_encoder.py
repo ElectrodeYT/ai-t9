@@ -14,7 +14,9 @@ Weights are stored as a .npz file — two float32 arrays, typically ~6 MB for
 
 from __future__ import annotations
 
+import io
 import math
+import shutil
 from pathlib import Path
 from typing import Sequence
 
@@ -145,8 +147,6 @@ class DualEncoder:
         does not support the random seeks that np.savez makes when given
         a file-path directly).
         """
-        import io
-        import shutil
         buf = io.BytesIO()
         np.savez_compressed(
             buf,

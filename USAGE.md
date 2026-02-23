@@ -296,7 +296,7 @@ python scripts/vast_orchestrate.py configs/vast-large.yaml --no-destroy
 | `--image IMAGE` | PyTorch 2.5 / CUDA 12.4 | Docker image |
 | `--install` | `wheel` | `wheel` = build + upload local wheel; `skip` = image has it |
 | `--ssh-retries N` | 8 | SSH connection attempts before giving up |
-| `--stabilize-wait N` | 15 | Seconds to wait after "running" before SSH |
+| `--stabilize-wait N` | 30 | Seconds to wait after "running" before SSH |
 | `--instance-id N` | — | Reuse an existing instance |
 | `--no-destroy` | off | Keep the instance after training |
 | `--dry-run` | off | Print best offer and exit |

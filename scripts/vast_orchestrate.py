@@ -226,8 +226,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--stabilize-wait",
         type=int,
-        default=15,
-        help="Seconds to wait after instance is 'running' before SSH (default: 15)",
+        default=30,
+        help="Seconds to wait after instance is 'running' before SSH (default: 30)",
     )
 
     # Step overrides forwarded to ai-t9-run

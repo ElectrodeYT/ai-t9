@@ -56,6 +56,7 @@ def _log(msg: str) -> None:
 def _s3_client(s3_cfg):
     """Create a boto3 S3 client from the config's S3 settings."""
     import boto3
+    from botocore.config import Config
 
     return boto3.client(
         "s3",
@@ -63,6 +64,11 @@ def _s3_client(s3_cfg):
         aws_access_key_id=s3_cfg.access_key,
         aws_secret_access_key=s3_cfg.secret_key,
         region_name=s3_cfg.region,
+        # SigV4 must be explicit for custom S3-compatible endpoints (e.g.
+        # Cloudflare R2). Without it, botocore's signing heuristics for
+        # non-AWS endpoints can produce requests that R2 rejects, manifesting
+        # as a confusing "NoSuchBucket" rather than an auth error.
+        config=Config(signature_version="s3v4"),
     )
 
 
@@ -548,7 +554,7 @@ def main(argv: list[str] | None = None) -> int:
     _log(f"  Steps:  {', '.join(steps)}")
     _log(f"  Output: {cfg.output_dir}")
     if cfg.s3.enabled:
-        _log(f"  S3:     {cfg.s3.bucket} (upload={cfg.s3.upload})")
+        _log(f"  S3:     {cfg.s3.endpoint} / {cfg.s3.bucket} (upload={cfg.s3.upload})")
     else:
         _log("  S3:     not configured")
     _log("")

@@ -43,6 +43,8 @@ import sys
 import time
 from pathlib import Path
 
+import paramiko, paramiko.ssh_exception
+
 DEFAULT_OUTPUT_DIR = Path("data")
 
 # ---------------------------------------------------------------------------
@@ -73,6 +75,9 @@ def search_offers(
         f"cuda_vers>={cuda_version} "
         f"dph_base<={max_price_per_hour} "
         f"num_gpus=1 "
+        f"inet_down>1000 " # Ensure good download speed for datasets/artifacts
+        f"inet_up>600 "    # Ensure good upload speed for checkpoints/artifacts, since they are not as big, we can be a bit more lenient here
+        f"disk_space>100 " # Ensure enough disk space for datasets and checkpoints (especially if using a larger batch size) (TODO: calculate this based on config)
         f"reliability>0.95"
     )
     result = _vastai(
@@ -146,8 +151,6 @@ def destroy_instance(instance_id: int) -> None:
 
 def _ssh_client(host: str, port: int, user: str = "root"):
     """Open an SSH connection to the instance."""
-    import paramiko
-
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     key_paths = [
@@ -166,12 +169,21 @@ def _ssh_client(host: str, port: int, user: str = "root"):
                     break
                 except Exception:
                     pass
-    client.connect(host, port=port, username=user, pkey=pkey, timeout=30)
+    
+    # While we did already wait a bit earlier, if the instance is still not fully ready, the SSH connection might fail. To mitigate this, we can add a retry loop here as well.
+    for attempt in range(5):
+        try:
+            client.connect(host, port=port, username=user, pkey=pkey, timeout=30)
+            return client
+        except paramiko.ssh_exception.NoValidConnectionsError as e:
+            print(f"SSH connection attempt {attempt+1}/5 failed: {e}")
+            time.sleep(5)
+
     return client
 
 
 def ssh_run(
-    client, command: str, env: dict[str, str] | None = None
+    client: paramiko.SSHClient, command: str, env: dict[str, str] | None = None
 ) -> int:
     """Run a command over SSH, streaming stdout/stderr.  Returns exit code."""
     env_prefix = ""
@@ -365,6 +377,10 @@ def main(argv: list[str] | None = None) -> int:
         ssh_port = int(info.get("ssh_port", 22))
         print(f"\nInstance ready: {ssh_host}:{ssh_port}")
 
+        # Delay a bit to let the instance stabilize (at least some instances seem to need to wait a bit)
+        print("Waiting a bit for the instance to stabilize…")
+        time.sleep(10)
+
         # ---- Connect ---------------------------------------------------
         print("Connecting via SSH…")
         client = _ssh_client(ssh_host, ssh_port)
@@ -373,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Installing ai-t9[train,data]…")
         exit_code = ssh_run(
             client,
-            'pip install --quiet "ai-t9[train,data]" pyyaml 2>&1 | tail -5',
+            'pip install --quiet "git+https://github.com/ElectrodeYT/ai-t9.git#egg=ai-t9[train,data]" pyyaml 2>&1 | tail -5',
         )
         if exit_code != 0:
             print("ERROR: Failed to install ai-t9", file=sys.stderr)

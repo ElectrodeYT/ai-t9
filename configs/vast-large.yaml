@@ -29,11 +29,11 @@ datasets:
   # Add larger corpora from HuggingFace
   # Uncomment and configure as needed:
 
-  # - type: huggingface
-  #   name: "wikitext"
-  #   config: "wikitext-103-raw-v1"
-  #   split: "train"
-  #   column: "text"
+  - type: huggingface
+    name: "wikitext"
+    config: "wikitext-103-raw-v1"
+    split: "train"
+    column: "text"
 
   # - type: huggingface
   #   name: "bookcorpus/bookcorpus"
@@ -48,7 +48,7 @@ datasets:
 # ---------------------------------------------------------------------------
 # Dictionary
 # ---------------------------------------------------------------------------
-dictionary: "tt9-dictionary/en-utf8.txt"
+# dictionary: "tt9-dictionary/en-utf8.txt"
 
 # ---------------------------------------------------------------------------
 # Vocabulary

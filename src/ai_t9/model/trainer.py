@@ -592,9 +592,12 @@ class _BaseTrainer:
             objective=self._objective, verbose=verbose,
         )
 
+        t_build = time.monotonic()
         model, compiled = self._build_model(torch, device)
         self._model = model
         model.train()
+        if verbose:
+            print(f"  [{time.strftime('%H:%M:%S')}] Model ready in {time.monotonic() - t_build:.1f}s", flush=True)
 
         # embed_fn for objectives that need to embed extra word IDs (e.g. SGNS
         # negative sampling).  Uses the *uncompiled* model so the call works
@@ -631,9 +634,14 @@ class _BaseTrainer:
             if 'scaler_state_dict' in self._checkpoint_data and self._checkpoint_data['scaler_state_dict'] and self._scaler:
                 self._scaler.load_state_dict(self._checkpoint_data['scaler_state_dict'])
 
+        if verbose:
+            print(f"  [{time.strftime('%H:%M:%S')}] Transferring {(ctx_np.nbytes + pos_np.nbytes) / 1e6:.0f} MB of pairs to {device}…", flush=True)
+        t_xfer = time.monotonic()
         ctx_dev = torch.from_numpy(ctx_np).to(device)
         pos_dev = torch.from_numpy(pos_np).to(device)
         del ctx_np, pos_np  # free CPU copies
+        if verbose:
+            print(f"  [{time.strftime('%H:%M:%S')}] Transfer done in {time.monotonic() - t_xfer:.1f}s", flush=True)
 
         if verbose:
             if is_cuda:
@@ -655,6 +663,10 @@ class _BaseTrainer:
                 f"torch.compile: {compiled_str}  |  amp: {amp_str}  |  {mem_str}"
             )
 
+        if verbose:
+            print(f"  [{time.strftime('%H:%M:%S')}] Starting training  "
+                  "(first batch triggers torch.compile kernel build — may take several minutes)", flush=True)
+
         t_train = time.monotonic()
         global_step = self._global_step
 
@@ -668,7 +680,7 @@ class _BaseTrainer:
             display_step = 0
 
             batch_range: object = range(n_batches)
-            if _tqdm is not None and verbose:
+            if _tqdm is not None:
                 batch_range = _tqdm(
                     batch_range,
                     desc=f"Epoch {epoch}/{self._epoch + epochs - 1}",
@@ -715,7 +727,7 @@ class _BaseTrainer:
                     display_step += 1
                     # Sync for tqdm only every ~20 optimizer steps rather than
                     # every batch — avoids stalling the GPU pipeline.
-                    if _tqdm is not None and verbose and display_step % 20 == 0:
+                    if _tqdm is not None and display_step % 20 == 0:
                         batch_range.set_postfix(
                             loss=f"{running_loss.item() / (b + 1):.4f}"
                         )
@@ -748,15 +760,24 @@ class _BaseTrainer:
             objective=self._objective, verbose=verbose,
         )
 
+        t_build = time.monotonic()
         model, compiled = self._build_model(torch, device)
         self._model = model
         model.train()
         embed_fn = getattr(model, 'embed_tgt_words', None)
+        if verbose:
+            print(f"  [{time.strftime('%H:%M:%S')}] Model ready in {time.monotonic() - t_build:.1f}s", flush=True)
 
         # Estimate total steps from the first shard.
+        if verbose:
+            print(f"  [{time.strftime('%H:%M:%S')}] Loading first shard for step estimate…", flush=True)
+        t_shard0 = time.monotonic()
         first_ctx, first_pos = load_pairs(
             shard_paths[0], context_window=self._context_window, vocab_size=self._vocab.size,
         )
+        if verbose:
+            print(f"  [{time.strftime('%H:%M:%S')}] First shard: {len(first_pos):,} pairs  "
+                  f"(loaded in {time.monotonic() - t_shard0:.1f}s)", flush=True)
         n_pairs_estimate = len(first_pos) * len(shard_paths) * epochs
         total_steps = max(1, n_pairs_estimate // (self._batch_size * self._accumulate))
         warmup_steps = int(total_steps * self._warmup_frac)
@@ -765,6 +786,10 @@ class _BaseTrainer:
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer, _make_lr_lambda(total_steps, warmup_steps, self._min_lr_frac)
         )
+
+        if verbose:
+            print(f"  [{time.strftime('%H:%M:%S')}] Starting training  "
+                  f"(first batch triggers torch.compile kernel build — may take several minutes)", flush=True)
 
         t_train = time.monotonic()
         global_step = 0
@@ -787,7 +812,14 @@ class _BaseTrainer:
                     prefetch_thread.join()
                     ctx_np, pos_np = prefetch_result[0]
                 else:
+                    t_load = time.monotonic()
                     ctx_np, pos_np = load_pairs(shard_path, context_window=self._context_window, vocab_size=self._vocab.size)
+                    if verbose:
+                        print(f"  [{time.strftime('%H:%M:%S')}] Shard loaded in {time.monotonic() - t_load:.1f}s", flush=True)
+
+                if verbose:
+                    print(f"  [{time.strftime('%H:%M:%S')}] Epoch {epoch}/{epochs}  "
+                          f"shard {si + 1}/{len(shard_order)}  {len(pos_np):,} pairs", flush=True)
 
                 # Start prefetch of next shard.
                 if prefetch and si + 1 < len(shard_order):
@@ -799,12 +831,20 @@ class _BaseTrainer:
                 else:
                     prefetch_thread = None
 
+                t_shard = time.monotonic()
                 sl, sb, global_step = self._train_shard_core(
                     ctx_np, pos_np, compiled, optimizer, scheduler,
                     device, global_step, amp_dtype, scaler, embed_fn,
+                    verbose=verbose,
+                    epoch_desc=f"Epoch {epoch}/{epochs} shard {si + 1}/{len(shard_order)}",
                 )
                 epoch_loss += sl
                 epoch_batches += sb
+                if verbose:
+                    shard_elapsed = time.monotonic() - t_shard
+                    pairs_per_sec = len(pos_np) / shard_elapsed if shard_elapsed > 0 else 0
+                    print(f"  [{time.strftime('%H:%M:%S')}] Shard done in {shard_elapsed:.1f}s  "
+                          f"({pairs_per_sec:,.0f} pairs/s)", flush=True)
 
             if verbose:
                 print(f"  Epoch {epoch}/{epochs}  loss={epoch_loss / max(epoch_batches, 1):.4f}")
@@ -815,9 +855,15 @@ class _BaseTrainer:
     def _train_shard_core(
         self, ctx_np, pos_np, compiled, optimizer, scheduler,
         device, global_step, amp_dtype, scaler, embed_fn,
+        verbose=False, epoch_desc="",
     ):
         """Train one shard of pairs. Returns (loss_float, n_batches, global_step)."""
         import torch
+        try:
+            from tqdm import tqdm as _tqdm
+        except ImportError:
+            _tqdm = None
+
         is_cuda = str(device).startswith("cuda")
         if is_cuda:
             ctx_dev = torch.from_numpy(ctx_np).pin_memory().to(device, non_blocking=True)
@@ -832,8 +878,18 @@ class _BaseTrainer:
         perm = torch.randperm(n_pairs, device=device)
         running_loss = torch.zeros(1, device=device)
         optimizer.zero_grad(set_to_none=True)
+        display_step = 0
 
-        for b in range(n_batches):
+        batch_range: object = range(n_batches)
+        if _tqdm is not None:
+            batch_range = _tqdm(
+                batch_range,
+                desc=epoch_desc,
+                unit="batch",
+                leave=False,
+            )
+
+        for b in batch_range:
             start = b * self._batch_size
             idx = perm[start:start + self._batch_size]
 
@@ -866,6 +922,9 @@ class _BaseTrainer:
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                display_step += 1
+                if _tqdm is not None and display_step % 20 == 0:
+                    batch_range.set_postfix(loss=f"{running_loss.item() / (b + 1):.4f}")
 
         del ctx_dev, pos_dev
         return running_loss.item(), n_batches, global_step
@@ -1016,7 +1075,11 @@ class DualEncoderTrainer(_BaseTrainer):
         embed_dim = self._embed_dim
         n_ngrams = len(self._ngram_to_id) + 1
 
+        t0 = time.monotonic()
+        print(f"  [{time.strftime('%H:%M:%S')}] Building n-gram word table ({vocab_size} words, {n_ngrams} n-grams)…", flush=True)
         ngram_table, ngram_counts = self._build_word_ngram_table(torch)
+        print(f"  [{time.strftime('%H:%M:%S')}] N-gram table built in {time.monotonic() - t0:.1f}s  "
+              f"(table shape: {list(ngram_table.shape)})", flush=True)
         ngram_table = ngram_table.to(device)
         ngram_counts = ngram_counts.to(device)
 
@@ -1073,7 +1136,11 @@ class DualEncoderTrainer(_BaseTrainer):
         compiled = model
         if hasattr(torch, "compile"):
             try:
+                t1 = time.monotonic()
+                print(f"  [{time.strftime('%H:%M:%S')}] torch.compile (max-autotune-no-cudagraphs)…", flush=True)
                 compiled = torch.compile(model, mode="max-autotune-no-cudagraphs")
+                print(f"  [{time.strftime('%H:%M:%S')}] torch.compile registered in {time.monotonic() - t1:.1f}s"
+                      "  (kernel compilation deferred to first batch)", flush=True)
             except Exception:
                 pass
 

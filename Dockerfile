@@ -16,7 +16,7 @@
 # whenever the dependencies or source change, then push manually.
 
 # ---- Base: PyTorch with CUDA -----------------------------------------------
-FROM pytorch/pytorch:2.5.0-cuda12.4-cudnn9-runtime
+FROM pytorch/pytorch:2.5.0-cuda12.4-cudnn9-devel
 
 # Minimal system packages
 RUN apt-get update && apt-get install -y --no-install-recommends \

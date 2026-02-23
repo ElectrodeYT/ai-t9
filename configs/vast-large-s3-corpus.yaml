@@ -1,0 +1,128 @@
+# ai-t9 training run configuration — Vast.ai GPU training
+#
+# Trains a serious model combining local corpus files with HuggingFace
+# datasets, using S3/R2 for artifact storage between steps.
+#
+# Local usage (full pipeline):
+#   ai-t9-run configs/vast-large.yaml
+#
+# Vast.ai usage (orchestrated):
+#   python scripts/vast_orchestrate.py configs/vast-large.yaml
+#
+# On a GPU instance (train step only, pairs pulled from S3):
+#   ai-t9-run configs/vast-large.yaml --step train
+#
+# Required environment variables for S3:
+#   AI_T9_S3_ENDPOINT, AI_T9_S3_BUCKET,
+#   AI_T9_S3_ACCESS_KEY, AI_T9_S3_SECRET_KEY
+
+name: "vast-large"
+
+# ---------------------------------------------------------------------------
+# Datasets — combined into one corpus file
+# ---------------------------------------------------------------------------
+datasets:
+  # Local corpus files
+  - type: local
+    path: "corpuses/"
+
+  # Add larger corpora from HuggingFace
+  # Uncomment and configure as needed:
+
+  #- type: huggingface
+  #  name: "wikitext"
+  #  config: "wikitext-103-raw-v1"
+  #  split: "train"
+  #  column: "text"
+
+  # - type: huggingface
+  #   name: "bookcorpus/bookcorpus"
+  #   split: "train"
+  #   column: "text"
+  #   max_lines: 5_000_000
+
+  # Download from S3 / R2 bucket
+  - type: s3
+    key: "corpuses/wikitext.txt"
+
+# ---------------------------------------------------------------------------
+# Dictionary
+# ---------------------------------------------------------------------------
+# dictionary: "tt9-dictionary/en-utf8.txt"
+
+# ---------------------------------------------------------------------------
+# Vocabulary
+# ---------------------------------------------------------------------------
+vocab:
+  max_words: 500_000
+  min_count: 20
+
+# ---------------------------------------------------------------------------
+# Model architecture
+# ---------------------------------------------------------------------------
+model:
+  embed_dim: 128                # larger embedding for more capacity
+  context_window: 3
+
+# ---------------------------------------------------------------------------
+# Training hyperparameters
+# ---------------------------------------------------------------------------
+training:
+  epochs: 10
+  lr: 0.001
+  weight_decay: 1e-4
+  warmup_frac: 0.05
+  min_lr_frac: 0.01
+  objective: "sgns"
+  n_negatives: 15
+  batch_size: 0                 # auto-detect (larger batches with SGNS)
+  accumulate_grad_batches: 4    # effective batch = batch_size × 4
+  clip_grad_norm: 1.0
+  seed: 42
+  device: "auto"
+  # checkpoint: "data/checkpoint.pth"
+
+# ---------------------------------------------------------------------------
+# Pair precomputation
+# ---------------------------------------------------------------------------
+pairs:
+  shard_size: 10_000_000
+
+# ---------------------------------------------------------------------------
+# Bigram model
+# ---------------------------------------------------------------------------
+ngram: true
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+output_dir: "data"
+
+# ---------------------------------------------------------------------------
+# Pipeline steps
+# ---------------------------------------------------------------------------
+steps:
+  - corpus
+  - vocab
+  - pairs
+  - train
+  - ngram
+
+# ---------------------------------------------------------------------------
+# S3 storage (Cloudflare R2 / AWS S3)
+# Values use ${VAR} to reference environment variables.
+# ---------------------------------------------------------------------------
+s3:
+  endpoint:   "${AI_T9_S3_ENDPOINT}"
+  bucket:     "${AI_T9_S3_BUCKET}"
+  access_key: "${AI_T9_S3_ACCESS_KEY}"
+  secret_key: "${AI_T9_S3_SECRET_KEY}"
+  region:     "auto"
+  upload: true                  # push artifacts to S3 after each step
+  paths:
+    vocab:  "vocab/vocab.json"
+    dict:   "vocab/dict.json"
+    pairs:  "pairs/"
+    model:  "models/model.npz"
+    ngram:  "ngrams/bigram.npz"
+    corpus: "corpuses/"

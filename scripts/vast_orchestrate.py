@@ -67,7 +67,7 @@ DEFAULT_OUTPUT_DIR = Path("data")
 
 # A known-good PyTorch image.  Override with --image if you need a different
 # CUDA or PyTorch version.
-_DEFAULT_IMAGE = "pytorch/pytorch:2.5.0-cuda12.4-cudnn9-runtime"
+_DEFAULT_IMAGE = "pytorch/pytorch:2.5.0-cuda12.4-cudnn9-devel"
 
 # Environment variables forwarded verbatim to the remote instance so that
 # ${VAR} references in YAML configs resolve correctly.

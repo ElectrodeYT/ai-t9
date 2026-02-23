@@ -9,7 +9,10 @@ Training objective: in-batch negative sampling (SimCLR / CLIP style)
     - Encode all contexts and targets in the batch → ctx_vecs, pos_vecs (B, dim)
     - Compute a (B, B) similarity matrix: logits = ctx_vecs @ pos_vecs.T / temperature
     - The diagonal entries are the correct (ctx_i, word_i) pairings
-    - Loss: cross-entropy over rows (each context must identify its target word)
+    - Loss: symmetric cross-entropy over both rows and columns (CLIP-style):
+        (CE(logits, labels) + CE(logits.T, labels)) / 2
+      Each context identifies its target word AND each target identifies its
+      context, doubling gradient signal at no extra compute cost.
 
   This gives B-1 negatives per positive instead of the previous 20 fixed
   negatives, providing ~200× more gradient signal at the same compute cost
@@ -76,12 +79,47 @@ def _resolve_device(torch, preference: str) -> "torch.device":
 
 
 def _auto_batch_size(torch, device) -> int:
-    """Pick the largest power-of-2 batch size whose (B,B) logits fit in VRAM.
+    """Pick a throughput-optimal power-of-2 batch size for in-batch negative contrastive training.
 
-    The dominant memory consumer for in-batch negative training is the
-    (B, B) logits matrix and its gradients.  This function allocates ~50%
-    of available GPU memory for that matrix, leaving room for model
-    parameters, optimizer state, and training data.
+    Why VRAM alone is the wrong guide
+    ----------------------------------
+    In-batch negative contrastive training (SimCLR / CLIP style) materialises
+    a (B, B) similarity matrix every step.  Its cost breaks into two parts:
+
+        O(B² × d) FLOPs  — the ctx @ pos.T matmul
+        O(B²) memory BW  — the cross-entropy softmax over all B² elements
+
+    For the small embedding dimensions used here (d = 64–256), the softmax
+    term is memory-bandwidth-bound regardless of GPU tier, so throughput in
+    *pairs per second* degrades as O(1/B).  Maximising B to fill VRAM
+    therefore hurts wall-clock training speed without a proportional quality
+    gain: going from B=2048 to B=16384 (8×) makes each step 64× more
+    expensive while processing only 8× more pairs, for a net 8× slowdown.
+
+    Throughput cap (the binding constraint)
+    ----------------------------------------
+    The cap is set per GPU tier based on free VRAM at startup, which is a
+    reasonable proxy for GPU class:
+
+        ≥ 40 GiB free : 8192  (A100 / H100 — far higher TFLOPS sustain
+                                larger batches before the bandwidth cliff)
+        ≥ 12 GiB free : 4096  (high-end consumer: RTX 4080/4090, 3090, …)
+             default  : 2048  (mid-range consumer: ≤ 12 GiB free)
+
+    Literature (SimCLR, SimCSE, CLIP) identifies B=2048–4096 as the quality/
+    throughput sweet spot: enough in-batch negatives for strong embeddings,
+    small enough that O(B²) compute does not dominate training time.
+
+    VRAM safety bound (secondary constraint)
+    -----------------------------------------
+    The logits peak (8 bytes × B²) must not exceed 25% of free VRAM:
+
+        8 bytes × B²  (2 BF16 logits + 2 BF16 grad + 4 FP32 softmax)
+
+    This is almost never the binding constraint for the typical embedding
+    model (V≈50k, d≤256), but prevents OOM on very memory-constrained devices.
+    The remaining 75% covers model weights, AdamW state, training data arrays,
+    and CUDA / PyTorch overhead.
 
     Falls back to 2048 on non-CUDA devices.
     """
@@ -93,13 +131,23 @@ def _auto_batch_size(torch, device) -> int:
     except AttributeError:
         free = torch.cuda.get_device_properties(device).total_memory
 
-    # Budget ~1.6% of free VRAM for the logits matrix + gradients.
-    # During forward + backward the logits matrix occupies:
-    #   (B, B) in AMP dtype (~2 bytes) + gradient (~2 bytes)
-    #   + cross-entropy softmax intermediates (~4 bytes float32)
-    #   ≈ 8 bytes per element total.
-    logit_budget = int(free * 0.016)
-    max_b = int(math.sqrt(logit_budget / 8))
+    # ---- Throughput cap (primary) ------------------------------------------
+    # Tiered by free VRAM as a GPU-class proxy; prevents the O(1/B) throughput
+    # cliff that occurs when the logits matmul becomes the dominant cost.
+    free_gib = free / 1024 ** 3
+    if free_gib >= 40:
+        throughput_cap = 8192   # data-centre (A100 / H100)
+    elif free_gib >= 12:
+        throughput_cap = 4096   # high-end consumer (RTX 4080+, 3090, …)
+    else:
+        throughput_cap = 2048   # mid-range consumer
+
+    # ---- VRAM safety bound (secondary) ------------------------------------
+    # Logits peak must fit in 25% of free VRAM.
+    _BYTES_PER_ELEM = 8   # BF16 logits(2) + BF16 grad(2) + FP32 softmax(4)
+    vram_max_b = int(math.sqrt(free * 0.25 / _BYTES_PER_ELEM))
+
+    max_b = min(vram_max_b, throughput_cap)
 
     if max_b < 2048:
         return 2048
@@ -214,10 +262,7 @@ def _precompute_pairs(
 
         # windows[t] == padded[t : t + context_window] — left-padded context
         # for the target at sentence index t.
-        strides = (padded.strides[0], padded.strides[0])
-        windows = np.lib.stride_tricks.as_strided(
-            padded, shape=(n, context_window), strides=strides,
-        )
+        windows = np.lib.stride_tricks.sliding_window_view(padded, window_shape=context_window)
 
         # Select only valid (non-UNK target) rows.  Fancy indexing copies
         # data, which also safely detaches from the strided view.
@@ -563,6 +608,8 @@ class _BaseTrainer:
         """
         device = _resolve_device(torch, self._device_pref)
         is_cuda = str(device).startswith("cuda")
+        random.seed(self._seed)
+        np.random.seed(self._seed)
         torch.manual_seed(self._seed)
 
         if is_cuda and torch.cuda.is_available() and torch.cuda.get_device_properties(device).major >= 8:
@@ -576,7 +623,7 @@ class _BaseTrainer:
                 amp_dtype = torch.bfloat16
             else:
                 amp_dtype = torch.float16
-                scaler = torch.cuda.amp.GradScaler()
+                scaler = torch.amp.GradScaler("cuda")
 
         return device, is_cuda, amp_dtype, scaler
 
@@ -592,9 +639,10 @@ class _BaseTrainer:
 
         model, compiled = self._build_model(torch, device)
         self._model = model
+        model.train()
 
         n_pairs = len(pos_np)
-        n_batches = max(1, n_pairs // self._batch_size)
+        n_batches = n_pairs // self._batch_size
         effective_batch = self._batch_size * self._accumulate
         total_steps = math.ceil(n_batches / self._accumulate) * epochs
         warmup_steps = int(total_steps * self._warmup_frac)
@@ -630,10 +678,9 @@ class _BaseTrainer:
                 f"torch.compile: {compiled_str}  |  amp: {amp_str}  |  {mem_str}"
             )
 
-        # Pre-allocate the full-batch labels tensor once; slice for the last
-        # (potentially smaller) batch.  Avoids a torch.arange() allocation on
-        # every iteration of the hot loop.
-        labels_full = torch.arange(self._batch_size, device=device)
+        # Pre-allocate labels once — drop-last batching guarantees every batch
+        # is exactly batch_size, so no slicing is needed in the hot loop.
+        labels = torch.arange(self._batch_size, device=device)
 
         t_train = time.monotonic()
         global_step = 0
@@ -659,16 +706,14 @@ class _BaseTrainer:
 
             for b in batch_range:
                 start = b * self._batch_size
-                end = min(start + self._batch_size, n_pairs)
-                idx = perm[start:end]
+                idx = perm[start:start + self._batch_size]
 
                 if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                     torch.compiler.cudagraph_mark_step_begin()
                 with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                     enabled=amp_dtype is not None):
                     logits = compiled(ctx_dev[idx], pos_dev[idx])
-                    labels = labels_full[:end - start]
-                    loss = ce_loss(logits, labels) / self._accumulate
+                    loss = (ce_loss(logits, labels) + ce_loss(logits.T, labels)) / 2 / self._accumulate
 
                 if scaler is not None:
                     scaler.scale(loss).backward()
@@ -718,6 +763,7 @@ class _BaseTrainer:
 
         model, compiled = self._build_model(torch, device)
         self._model = model
+        model.train()
 
         # Estimate total steps from the first shard.
         first_ctx, first_pos = load_pairs(
@@ -795,23 +841,21 @@ class _BaseTrainer:
             pos_dev = torch.from_numpy(pos_np).to(device)
 
         n_pairs = len(pos_np)
-        n_batches = max(1, n_pairs // self._batch_size)
+        n_batches = n_pairs // self._batch_size
         perm = torch.randperm(n_pairs, device=device)
-        labels_full = torch.arange(self._batch_size, device=device)
+        labels = torch.arange(self._batch_size, device=device)
         running_loss = torch.zeros(1, device=device)
         optimizer.zero_grad(set_to_none=True)
 
         for b in range(n_batches):
             start = b * self._batch_size
-            end = min(start + self._batch_size, n_pairs)
-            idx = perm[start:end]
+            idx = perm[start:start + self._batch_size]
 
             if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                 torch.compiler.cudagraph_mark_step_begin()
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
                 logits = compiled(ctx_dev[idx], pos_dev[idx])
-                labels = labels_full[:end - start]
-                loss = ce_loss(logits, labels) / self._accumulate
+                loss = (ce_loss(logits, labels) + ce_loss(logits.T, labels)) / 2 / self._accumulate
 
             if scaler is not None:
                 scaler.scale(loss).backward()

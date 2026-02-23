@@ -269,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--image",
-        default="pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime",
+        default="pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime",
         help="Docker image for the instance",
     )
     parser.add_argument(
@@ -389,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Installing ai-t9[train,data]…")
         exit_code = ssh_run(
             client,
-            'pip install --quiet "git+https://github.com/ElectrodeYT/ai-t9.git#egg=ai-t9[train,data]" pyyaml 2>&1 | tail -5',
+            'pip install "git+https://github.com/ElectrodeYT/ai-t9.git#egg=ai-t9[train,data]" pyyaml 2>&1 | tail -5',
         )
         if exit_code != 0:
             print("ERROR: Failed to install ai-t9", file=sys.stderr)

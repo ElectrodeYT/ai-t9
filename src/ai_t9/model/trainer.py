@@ -689,6 +689,7 @@ class _BaseTrainer:
                 )
 
             optimizer.zero_grad(set_to_none=True)
+            t_loop = time.monotonic()
 
             for b in batch_range:
                 start = b * self._batch_size
@@ -728,9 +729,12 @@ class _BaseTrainer:
                     # Sync for tqdm only every ~20 optimizer steps rather than
                     # every batch — avoids stalling the GPU pipeline.
                     if _tqdm is not None and display_step % 20 == 0:
-                        batch_range.set_postfix(
-                            loss=f"{running_loss.item() / (b + 1):.4f}"
-                        )
+                        elapsed_loop = time.monotonic() - t_loop
+                        p_s = (b + 1) * self._batch_size / elapsed_loop if elapsed_loop > 0 else 0
+                        batch_range.set_postfix({
+                            "loss": f"{running_loss.item() / (b + 1):.4f}",
+                            "p/s": f"{p_s:,.0f}",
+                        })
 
             elapsed = time.monotonic() - t_epoch
             avg_loss = running_loss.item() / max(n_batches, 1)  # one sync per epoch
@@ -889,6 +893,8 @@ class _BaseTrainer:
                 leave=False,
             )
 
+        t_loop = time.monotonic()
+
         for b in batch_range:
             start = b * self._batch_size
             idx = perm[start:start + self._batch_size]
@@ -924,7 +930,12 @@ class _BaseTrainer:
                 global_step += 1
                 display_step += 1
                 if _tqdm is not None and display_step % 20 == 0:
-                    batch_range.set_postfix(loss=f"{running_loss.item() / (b + 1):.4f}")
+                    elapsed_loop = time.monotonic() - t_loop
+                    p_s = (b + 1) * self._batch_size / elapsed_loop if elapsed_loop > 0 else 0
+                    batch_range.set_postfix({
+                        "loss": f"{running_loss.item() / (b + 1):.4f}",
+                        "p/s": f"{p_s:,.0f}",
+                    })
 
         del ctx_dev, pos_dev
         return running_loss.item(), n_batches, global_step

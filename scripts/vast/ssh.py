@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import select
 import shlex
+import socket
 import sys
 import time
 from pathlib import Path
@@ -125,23 +126,37 @@ def ssh_run(
     _stdin, stdout, _stderr = client.exec_command(full_cmd, get_pty=True)
     channel = stdout.channel
 
-    while not channel.exit_status_ready():
-        rready, _, _ = select.select([channel], [], [], 0.5)
-        if rready:
+    try:
+        while not channel.exit_status_ready():
+            rready, _, _ = select.select([channel], [], [], 0.5)
+            if rready:
+                data = channel.recv(4096)
+                if data:
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.flush()
+                elif not channel.exit_status_ready():
+                    # EOF with no exit status — connection was cut
+                    raise ConnectionError(
+                        "SSH channel closed without exit status "
+                        "— instance was likely interrupted"
+                    )
+
+        # Drain any remaining buffered output
+        while True:
             data = channel.recv(4096)
-            if data:
-                sys.stdout.buffer.write(data)
-                sys.stdout.flush()
+            if not data:
+                break
+            sys.stdout.buffer.write(data)
+        sys.stdout.flush()
+    except (paramiko.ssh_exception.SSHException, OSError, socket.error) as exc:
+        raise ConnectionError(f"SSH connection lost mid-session: {exc}") from exc
 
-    # Drain any remaining buffered output
-    while True:
-        data = channel.recv(4096)
-        if not data:
-            break
-        sys.stdout.buffer.write(data)
-    sys.stdout.flush()
-
-    return channel.recv_exit_status()
+    exit_code = channel.recv_exit_status()
+    if exit_code == -1:
+        raise ConnectionError(
+            "SSH channel returned no exit status — instance was likely interrupted"
+        )
+    return exit_code
 
 
 def scp_upload(client: paramiko.SSHClient, local_path: Path, remote_path: str) -> None:

@@ -35,6 +35,15 @@ Usage:
     # Use a custom Docker image (package pre-installed — no wheel upload needed)
     python scripts/vast_orchestrate.py configs/vast-large.yaml \\
         --image ai-t9-trainer:latest --install skip
+
+    # Interruptable (spot-like) instance — cheaper, may be preempted
+    python scripts/vast_orchestrate.py configs/vast-large.yaml --interruptable
+
+    # Interruptable with automatic respawn on interruption (requires S3 for state)
+    python scripts/vast_orchestrate.py configs/vast-large.yaml --interruptable --retries 3
+
+    # Multi-GPU instance
+    python scripts/vast_orchestrate.py configs/vast-large.yaml --num-gpus 2 --max-price 2.0
 """
 
 from __future__ import annotations
@@ -159,10 +168,16 @@ def main(argv: list[str] | None = None) -> int:
         help="GPU name filter for offer search (default: RTX_3090)",
     )
     parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs to search for (default: 1)",
+    )
+    parser.add_argument(
         "--min-vram",
         type=int,
         default=16,
-        help="Minimum VRAM in GB (default: 16)",
+        help="Minimum VRAM in GB per GPU (default: 16)",
     )
     parser.add_argument(
         "--max-price",
@@ -185,6 +200,24 @@ def main(argv: list[str] | None = None) -> int:
         "--image",
         default=_DEFAULT_IMAGE,
         help=f"Docker image for the instance (default: {_DEFAULT_IMAGE})",
+    )
+    parser.add_argument(
+        "--interruptable",
+        action="store_true",
+        help=(
+            "Rent as an interruptable (spot-like) instance — cheaper but may be "
+            "preempted. Use --retries to automatically respawn on interruption."
+        ),
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help=(
+            "Number of times to retry by provisioning a new instance on SSH "
+            "disconnection (default: 0). Useful with --interruptable and S3 "
+            "state so partially-completed work is not lost between attempts."
+        ),
     )
     parser.add_argument(
         "--instance-id",
@@ -275,148 +308,189 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- Dry run -----------------------------------------------------------
     if args.dry_run:
+        interruptable_str = " interruptable" if args.interruptable else ""
         print(
-            f"Searching for '{args.gpu}' offers "
-            f"(max ${args.max_price}/hr, ≥{args.min_vram} GB VRAM, "
+            f"Searching for '{args.gpu}' ×{args.num_gpus}{interruptable_str} offers "
+            f"(max ${args.max_price}/hr, ≥{args.min_vram} GB VRAM/GPU, "
             f"CUDA ≥{args.cuda_version})…"
         )
         offers = search_offers(
-            args.gpu, args.min_vram, args.max_price, args.cuda_version
+            args.gpu, args.min_vram, args.max_price, args.cuda_version,
+            num_gpus=args.num_gpus,
         )
         if not offers:
             print("No matching offers found.")
             return 1
         best = offers[0]
         print("\nBest offer:")
-        print(f"  ID:       {best.get('id')}")
-        print(f"  GPU:      {best.get('gpu_name')} × {best.get('num_gpus')}")
-        print(f"  VRAM:     {best.get('gpu_ram', 0):.0f} GB")
-        print(f"  Price:    ${best.get('dph_base', 0):.3f}/hr")
-        print(f"  Location: {best.get('geolocation', 'unknown')}")
+        print(f"  ID:           {best.get('id')}")
+        print(f"  GPU:          {best.get('gpu_name')} × {best.get('num_gpus')}")
+        print(f"  VRAM:         {best.get('gpu_ram', 0):.0f} GB/GPU  "
+              f"({best.get('gpu_ram', 0) * best.get('num_gpus', 1):.0f} GB total)")
+        print(f"  Price:        ${best.get('dph_base', 0):.3f}/hr (on-demand)")
+        if best.get("min_bid") is not None:
+            print(f"  Min bid:      ${best['min_bid']:.3f}/hr (interruptable)")
+        print(f"  Location:     {best.get('geolocation', 'unknown')}")
+        print(f"  Reliability:  {best.get('reliability', 0):.1%}")
         return 0
 
-    # ---- Provision or reuse instance ---------------------------------------
-    instance_id = args.instance_id
-    created = False
-    if instance_id is None:
-        print(f"Searching for '{args.gpu}' offers…")
-        offers = search_offers(
-            args.gpu, args.min_vram, args.max_price, args.cuda_version
-        )
-        if not offers:
-            print(
-                "ERROR: No matching offers found. Try relaxing --gpu, --min-vram, "
-                "--max-price, or --cuda-version.",
-                file=sys.stderr,
-            )
-            return 1
-        best = offers[0]
-        print(
-            f"Best offer: ID={best['id']} GPU={best['gpu_name']} "
-            f"${best['dph_base']:.3f}/hr"
-        )
-        print("Creating instance…")
-        try:
-            instance_id = create_instance(best["id"], image=args.image, disk_gb=args.disk)
-        except RuntimeError as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            return 1
-        created = True
-        print(f"Instance {instance_id} created. Waiting for it to start…")
+    # ---- Provision + train (with optional retries on interruption) ---------
+    attempts_total = args.retries + 1
 
-    try:
-        info = wait_for_instance(instance_id)
-        ssh_host = info.get("ssh_host") or info.get("public_ipaddr")
-        ssh_port = int(info.get("ssh_port", 22))
-        print(f"Instance ready: {ssh_host}:{ssh_port}")
+    for attempt in range(1, attempts_total + 1):
+        if attempt > 1:
+            print(f"\n--- Retry {attempt - 1}/{args.retries} ---")
 
-        # Give the instance a moment to finish initialising before SSH
-        if args.stabilize_wait > 0:
-            print(f"Waiting {args.stabilize_wait}s for instance to stabilise…")
-            time.sleep(args.stabilize_wait)
-
-        # ---- Connect -------------------------------------------------------
-        print("Connecting via SSH…")
-        try:
-            client = connect_ssh(ssh_host, ssh_port, max_retries=args.ssh_retries)
-        except ConnectionError as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            return 1
-
-        # ---- Install ai-t9 ------------------------------------------------
-        if args.install == "wheel":
-            remote_wheel = f"/tmp/{wheel_path.name}"
-            print(f"Uploading wheel → {remote_wheel}")
-            scp_upload(client, wheel_path, remote_wheel)
-            print("Installing ai-t9 from wheel…")
-            exit_code = ssh_run(
-                client,
-                f'pip install --quiet "{remote_wheel}[train,data]" 2>&1 | tail -5',
-            )
-            if exit_code != 0:
-                print("ERROR: Failed to install ai-t9 from wheel", file=sys.stderr)
-                return 1
+        # Provision a new instance, or reuse the caller-supplied one on attempt 1.
+        created = False
+        if attempt == 1 and args.instance_id is not None:
+            instance_id = args.instance_id
         else:
-            print("Skipping package installation (--install skip)")
-
-        # ---- Upload config -------------------------------------------------
-        remote_config = "/root/train_config.yaml"
-        print(f"Uploading {config_path} → {remote_config}")
-        scp_upload(client, config_path, remote_config)
-
-        # ---- Build the ai-t9-run command -----------------------------------
-        run_cmd = f"ai-t9-run {remote_config}"
-        if args.step:
-            for s in args.step:
-                run_cmd += f" --step {s}"
-        if args.skip:
-            for s in args.skip:
-                run_cmd += f" --skip {s}"
-
-        # ---- Run training --------------------------------------------------
-        print(f"Running: {run_cmd}")
-        exit_code = ssh_run(client, run_cmd, env=forward_env)
-        if exit_code != 0:
-            print(
-                f"\nERROR: ai-t9-run exited with code {exit_code}",
-                file=sys.stderr,
+            interruptable_str = " interruptable" if args.interruptable else ""
+            print(f"Searching for '{args.gpu}' ×{args.num_gpus}{interruptable_str} offers…")
+            offers = search_offers(
+                args.gpu, args.min_vram, args.max_price, args.cuda_version,
+                num_gpus=args.num_gpus,
             )
-            return exit_code
-
-        # ---- Download artifacts --------------------------------------------
-        out = Path(args.output_dir)
-        out.mkdir(parents=True, exist_ok=True)
-
-        # Determine the remote output directory from the config
-        remote_output_dir = "/root/" + _read_remote_output_dir(config_path).lstrip("/")
-        print(f"\nDownloading artifacts from {remote_output_dir}/ to {out}/…")
-
-        artifacts = ["model.npz", "bigram.npz", "vocab.json", "dict.json"]
-        missing: list[str] = []
-        for name in artifacts:
-            remote = f"{remote_output_dir}/{name}"
-            local = out / name
+            if not offers:
+                print(
+                    "ERROR: No matching offers found. Try relaxing --gpu, --min-vram, "
+                    "--max-price, --cuda-version, or --num-gpus.",
+                    file=sys.stderr,
+                )
+                return 1
+            best = offers[0]
+            print(
+                f"Best offer: ID={best['id']}  GPU={best['gpu_name']} ×{best['num_gpus']}  "
+                f"${best['dph_base']:.3f}/hr"
+            )
+            print("Creating instance…")
             try:
-                scp_download(client, remote, local)
-                size_mb = local.stat().st_size / 1e6
-                print(f"  {name}: {size_mb:.1f} MB")
-            except IOError:
-                # File simply wasn't produced (e.g. ngram skipped) — not an error
-                print(f"  {name}: not found on remote, skipping")
-                missing.append(name)
-            except Exception as exc:
-                print(f"  {name}: download failed — {exc}", file=sys.stderr)
-                missing.append(name)
+                instance_id = create_instance(
+                    best["id"],
+                    image=args.image,
+                    disk_gb=args.disk,
+                    interruptable=args.interruptable,
+                )
+            except RuntimeError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 1
+            created = True
+            interruptable_note = " (interruptable)" if args.interruptable else ""
+            print(f"Instance {instance_id} created{interruptable_note}. Waiting for it to start…")
 
-        client.close()
+        interrupted = False
+        try:
+            info = wait_for_instance(instance_id)
+            ssh_host = info.get("ssh_host") or info.get("public_ipaddr")
+            ssh_port = int(info.get("ssh_port", 22))
+            print(f"Instance ready: {ssh_host}:{ssh_port}")
 
-        if missing:
-            print(f"\nNote: {len(missing)} artifact(s) were not downloaded: {', '.join(missing)}")
+            # Give the instance a moment to finish initialising before SSH
+            if args.stabilize_wait > 0:
+                print(f"Waiting {args.stabilize_wait}s for instance to stabilise…")
+                time.sleep(args.stabilize_wait)
 
-    finally:
-        if created and not args.no_destroy:
-            print("\nDestroying instance…")
-            destroy_instance(instance_id)
+            # ---- Connect ---------------------------------------------------
+            print("Connecting via SSH…")
+            client = connect_ssh(ssh_host, ssh_port, max_retries=args.ssh_retries)
+
+            # ---- Install ai-t9 ---------------------------------------------
+            if args.install == "wheel":
+                remote_wheel = f"/tmp/{wheel_path.name}"
+                print(f"Uploading wheel → {remote_wheel}")
+                scp_upload(client, wheel_path, remote_wheel)
+                print("Installing ai-t9 from wheel…")
+                exit_code = ssh_run(
+                    client,
+                    f'pip install --quiet "{remote_wheel}[train,data]" 2>&1 | tail -5',
+                )
+                if exit_code != 0:
+                    print("ERROR: Failed to install ai-t9 from wheel", file=sys.stderr)
+                    return 1
+            else:
+                print("Skipping package installation (--install skip)")
+
+            # ---- Upload config ---------------------------------------------
+            remote_config = "/root/train_config.yaml"
+            print(f"Uploading {config_path} → {remote_config}")
+            scp_upload(client, config_path, remote_config)
+
+            # ---- Build the ai-t9-run command --------------------------------
+            run_cmd = f"ai-t9-run {remote_config}"
+            if args.step:
+                for s in args.step:
+                    run_cmd += f" --step {s}"
+            if args.skip:
+                for s in args.skip:
+                    run_cmd += f" --skip {s}"
+
+            # ---- Run training ----------------------------------------------
+            print(f"Running: {run_cmd}")
+            exit_code = ssh_run(client, run_cmd, env=forward_env)
+            if exit_code != 0:
+                print(
+                    f"\nERROR: ai-t9-run exited with code {exit_code}",
+                    file=sys.stderr,
+                )
+                return exit_code
+
+            # ---- Download artifacts ----------------------------------------
+            out = Path(args.output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+
+            remote_output_dir = "/root/" + _read_remote_output_dir(config_path).lstrip("/")
+            print(f"\nDownloading artifacts from {remote_output_dir}/ to {out}/…")
+
+            artifacts = ["model.npz", "bigram.npz", "vocab.json", "dict.json"]
+            missing: list[str] = []
+            for name in artifacts:
+                remote = f"{remote_output_dir}/{name}"
+                local = out / name
+                try:
+                    scp_download(client, remote, local)
+                    size_mb = local.stat().st_size / 1e6
+                    print(f"  {name}: {size_mb:.1f} MB")
+                except IOError:
+                    print(f"  {name}: not found on remote, skipping")
+                    missing.append(name)
+                except Exception as exc:
+                    print(f"  {name}: download failed — {exc}", file=sys.stderr)
+                    missing.append(name)
+
+            client.close()
+
+            if missing:
+                print(f"\nNote: {len(missing)} artifact(s) were not downloaded: {', '.join(missing)}")
+
+        except ConnectionError as exc:
+            interrupted = True
+            print(f"\nSSH connection lost: {exc}", file=sys.stderr)
+            if attempt < attempts_total:
+                print(
+                    f"Instance may have been interrupted. "
+                    f"Retrying with a new instance (attempt {attempt + 1}/{attempts_total})…"
+                )
+            else:
+                if attempts_total > 1:
+                    print(f"All {attempts_total} attempt(s) exhausted.", file=sys.stderr)
+                # Fall through to finally, then return below.
+
+        finally:
+            if created:
+                # Always destroy interrupted instances (they are unusable).
+                # For successful/failed-non-interrupt runs, respect --no-destroy.
+                if interrupted or not args.no_destroy:
+                    print("\nDestroying instance…")
+                    destroy_instance(instance_id)
+
+        if interrupted:
+            if attempt >= attempts_total:
+                return 1
+            continue  # retry
+
+        # Training completed successfully — exit the retry loop.
+        break
 
     print("\nDone.")
     return 0

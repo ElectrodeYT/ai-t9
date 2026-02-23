@@ -23,6 +23,7 @@ def search_offers(
     max_price_per_hour: float = 10.0,
     cuda_version: str = "12.0",
     min_disk_gb: int = 100,
+    num_gpus: int = 1,
     limit: int = 5,
 ) -> list[dict]:
     """Search for GPU offers matching the given constraints.
@@ -34,7 +35,7 @@ def search_offers(
         f"gpu_ram>={min_vram_gb} "
         f"cuda_vers>={cuda_version} "
         f"dph_base<={max_price_per_hour} "
-        f"num_gpus=1 "
+        f"num_gpus={num_gpus} "
         f"inet_down>1000 "   # Good download speed for datasets/artifacts
         f"inet_up>600 "      # Good upload speed for checkpoints
         f"disk_space>={min_disk_gb} "
@@ -59,14 +60,18 @@ def create_instance(
     offer_id: int,
     image: str,
     disk_gb: int = 30,
+    interruptable: bool = False,
 ) -> int:
     """Create an instance from an offer ID. Returns the new instance ID."""
-    result = _vastai(
+    args = [
         "create", "instance", str(offer_id),
         "--image", image,
         "--disk", str(disk_gb),
         "--raw",
-    )
+    ]
+    if interruptable:
+        args.append("--interruptable")
+    result = _vastai(*args)
     if result.returncode != 0:
         raise RuntimeError(
             f"vastai create instance failed (exit {result.returncode}): "

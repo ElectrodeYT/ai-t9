@@ -274,6 +274,17 @@ python scripts/vast_orchestrate.py configs/vast-large.yaml --dry-run
 python scripts/vast_orchestrate.py configs/vast-large.yaml \
     --gpu H100 --max-price 3.0
 
+# Multi-GPU instance (2× RTX 3090)
+python scripts/vast_orchestrate.py configs/vast-large.yaml \
+    --num-gpus 2 --max-price 2.0
+
+# Interruptable (spot-like) instance — cheaper, may be preempted
+python scripts/vast_orchestrate.py configs/vast-large.yaml --interruptable
+
+# Interruptable with automatic respawn on interruption (requires S3 for state)
+python scripts/vast_orchestrate.py configs/vast-large.yaml \
+    --interruptable --retries 3
+
 # Skip specific steps (e.g. corpus and vocab already in S3)
 python scripts/vast_orchestrate.py configs/vast-large.yaml \
     --skip corpus --skip vocab
@@ -289,11 +300,14 @@ python scripts/vast_orchestrate.py configs/vast-large.yaml --no-destroy
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--gpu NAME` | `RTX_3090` | GPU name filter for offer search |
-| `--min-vram N` | 16 | Minimum VRAM in GB |
+| `--num-gpus N` | 1 | Number of GPUs to search for |
+| `--min-vram N` | 16 | Minimum VRAM in GB per GPU |
 | `--max-price F` | 1.0 | Max $/hour |
 | `--cuda-version V` | `12.0` | Minimum CUDA version |
 | `--disk N` | 30 | Instance disk size in GB |
 | `--image IMAGE` | PyTorch 2.5 / CUDA 12.4 | Docker image |
+| `--interruptable` | off | Rent as spot-like instance (cheaper, may be preempted) |
+| `--retries N` | 0 | Re-provision and retry on SSH disconnection (useful with `--interruptable` + S3) |
 | `--install` | `wheel` | `wheel` = build + upload local wheel; `skip` = image has it |
 | `--ssh-retries N` | 8 | SSH connection attempts before giving up |
 | `--stabilize-wait N` | 30 | Seconds to wait after "running" before SSH |

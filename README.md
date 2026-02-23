@@ -230,12 +230,6 @@ print(session.dial("269"))    # next word, informed by "home"
 Corpus files should be UTF-8 plain text with one utterance per line. Only
 alphabetic tokens are counted (punctuation and numbers are ignored).
 
-A Discord message export can be converted with the included helper:
-
-```bash
-python scripts/discord_to_corpus.py messages.sqlite -o corpuses/discord.txt
-```
-
 ## Data artifacts
 
 A complete setup uses four files in the `data/` directory:

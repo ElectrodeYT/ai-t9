@@ -48,6 +48,7 @@
 - Preserve lowercase/alpha filtering behavior in corpus ingestion (`isalpha()` gates in vocab/trainer scripts).
 - If changing corpus preprocessing, align with `scripts/discord_to_corpus.py` output expectation: one utterance per line, UTF-8 plain text.
 - Prefer extending existing CLIs (`src/ai_t9/_scripts/build_vocab.py`, `src/ai_t9/_scripts/train.py`) over adding new entry points.
+- There are no downstream dependants of this project. You may change and break any APi at any time, but please be considerate of your future self and maintain internal consistency.
 
 ## Modal cloud training
 - The Modal app (`modal_app.py`) wraps existing CLIs via `subprocess.run` — it does **not** duplicate training logic.  Changes to the training pipeline should happen in the CLIs, not in `modal_app.py`.

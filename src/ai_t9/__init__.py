@@ -36,7 +36,6 @@ Training a custom model (requires torch)::
 from .predictor import RankedCandidate, T9Predictor
 from .session import T9Session
 from .t9_map import T9_MAP, word_to_digits, is_valid_digit_sequence
-from .model.char_ngram_encoder import CharNgramDualEncoder
 from .model.dual_encoder import DualEncoder
 
 __all__ = [
@@ -47,5 +46,4 @@ __all__ = [
     "word_to_digits",
     "is_valid_digit_sequence",
     "DualEncoder",
-    "CharNgramDualEncoder",
 ]

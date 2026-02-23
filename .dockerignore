@@ -1,0 +1,26 @@
+# Python build artefacts & caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtualenvs & local-python caches
+.venv
+.pytest_cache
+.claude
+
+# Local test/dictionary data not needed in image
+tt9-dictionary
+
+# Corpus/output blobs – usually mounted or rebuilt elsewhere
+data/
+corpuses/
+larger-corpuses/
+too-big-stuff/
+modal_data/
+
+# Database exports, CSVs, etc.
+*.db
+*.csv
+*.sqlite

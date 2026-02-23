@@ -479,12 +479,17 @@ class _BaseTrainer:
         self._device_pref = device
         self._debug = debug
         self._model = None
+        self._epoch = 0
+        self._global_step = 0
+        self._optimizer = None
+        self._scheduler = None
+        self._scaler = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def train_from_nltk(self, epochs: int = 3, verbose: bool = True) -> None:
+    def train_from_nltk(self, epochs: int = 3, verbose: bool = True, checkpoint_path: str | Path | None = None) -> None:
         """Train on the NLTK Brown corpus (auto-downloaded)."""
         torch = _require_torch()
         t0 = time.monotonic()
@@ -520,7 +525,7 @@ class _BaseTrainer:
             print(f"  Total: {len(sentences):,} sentences")
         self._train(sentences, epochs=epochs, torch=torch, verbose=verbose)
 
-    def train_from_pairs_file(self, pairs_path: str | Path, epochs: int = 3, verbose: bool = True) -> None:
+    def train_from_pairs_file(self, pairs_path: str | Path, epochs: int = 3, verbose: bool = True, checkpoint_path: str | Path | None = None) -> None:
         """Train directly from a precomputed pairs .npz file."""
         torch = _require_torch()
         if verbose:
@@ -533,7 +538,7 @@ class _BaseTrainer:
         if verbose:
             print(f"  {len(pos_np):,} pairs loaded")
         self._before_training()
-        self._train_from_arrays(ctx_np, pos_np, epochs=epochs, torch=torch, verbose=verbose)
+        self._train_from_arrays(ctx_np, pos_np, epochs=epochs, torch=torch, verbose=verbose, checkpoint_path=checkpoint_path)
 
     def train_from_pairs_dir(
         self,
@@ -542,6 +547,7 @@ class _BaseTrainer:
         epochs: int = 3,
         prefetch: bool = True,
         verbose: bool = True,
+        checkpoint_path: str | Path | None = None,
     ) -> None:
         """Train from a directory of sharded pairs .npz files.
 
@@ -627,7 +633,7 @@ class _BaseTrainer:
 
         return device, is_cuda, amp_dtype, scaler
 
-    def _train_from_arrays(self, ctx_np, pos_np, epochs, torch, verbose):
+    def _train_from_arrays(self, ctx_np, pos_np, epochs, torch, verbose, checkpoint_path=None):
         """Core epoch/batch training loop operating on preloaded numpy pair arrays."""
         try:
             from tqdm import tqdm as _tqdm
@@ -641,6 +647,12 @@ class _BaseTrainer:
         self._model = model
         model.train()
 
+        # Load checkpoint if available
+        if hasattr(self, '_checkpoint_data') and self._checkpoint_data:
+            self._model.load_state_dict(self._checkpoint_data['model_state_dict'])
+            self._epoch = self._checkpoint_data.get('epoch', 0)
+            self._global_step = self._checkpoint_data.get('global_step', 0)
+
         n_pairs = len(pos_np)
         n_batches = n_pairs // self._batch_size
         effective_batch = self._batch_size * self._accumulate
@@ -653,6 +665,19 @@ class _BaseTrainer:
             optimizer, _make_lr_lambda(total_steps, warmup_steps, self._min_lr_frac)
         )
         ce_loss = torch.nn.CrossEntropyLoss()
+
+        self._optimizer = optimizer
+        self._scheduler = scheduler
+        self._scaler = scaler
+
+        # Load optimizer/scheduler states if checkpoint
+        if hasattr(self, '_checkpoint_data') and self._checkpoint_data:
+            if 'optimizer_state_dict' in self._checkpoint_data and self._checkpoint_data['optimizer_state_dict']:
+                self._optimizer.load_state_dict(self._checkpoint_data['optimizer_state_dict'])
+            if 'scheduler_state_dict' in self._checkpoint_data and self._checkpoint_data['scheduler_state_dict']:
+                self._scheduler.load_state_dict(self._checkpoint_data['scheduler_state_dict'])
+            if 'scaler_state_dict' in self._checkpoint_data and self._checkpoint_data['scaler_state_dict'] and self._scaler:
+                self._scaler.load_state_dict(self._checkpoint_data['scaler_state_dict'])
 
         ctx_dev = torch.from_numpy(ctx_np).to(device)
         pos_dev = torch.from_numpy(pos_np).to(device)
@@ -683,9 +708,10 @@ class _BaseTrainer:
         labels = torch.arange(self._batch_size, device=device)
 
         t_train = time.monotonic()
-        global_step = 0
+        global_step = self._global_step
 
-        for epoch in range(1, epochs + 1):
+        for epoch in range(self._epoch + 1, self._epoch + epochs + 1):
+            self._epoch = epoch
             t_epoch = time.monotonic()
             # Accumulate loss on GPU to avoid a blocking GPU→CPU sync every batch.
             # A single .item() call per epoch (at reporting time) is all we need.
@@ -697,7 +723,7 @@ class _BaseTrainer:
             if _tqdm is not None and verbose:
                 batch_range = _tqdm(
                     batch_range,
-                    desc=f"Epoch {epoch}/{epochs}",
+                    desc=f"Epoch {epoch}/{self._epoch + epochs - 1}",
                     unit="batch",
                     leave=False,
                 )
@@ -749,9 +775,14 @@ class _BaseTrainer:
             pairs_per_sec = n_pairs / elapsed if elapsed > 0 else 0
             if verbose:
                 print(
-                    f"  Epoch {epoch}/{epochs}  loss={avg_loss:.4f}  "
+                    f"  Epoch {epoch}/{self._epoch + epochs - 1}  loss={avg_loss:.4f}  "
                     f"time={elapsed:.1f}s  ({pairs_per_sec:,.0f} pairs/s)"
                 )
+
+            if checkpoint_path:
+                self.save_checkpoint(checkpoint_path)
+
+        self._global_step = global_step
 
         if verbose:
             _log_training_complete(t_train)
@@ -887,98 +918,22 @@ class _BaseTrainer:
 # DualEncoderTrainer
 # ---------------------------------------------------------------------------
 
-class DualEncoderTrainer(_BaseTrainer):
-    """Train a DualEncoder from a text corpus using in-batch negative sampling.
-
-    Uses a standard nn.Module with torch.compile() for efficient GPU training.
-
-    Training objective: in-batch negatives (SimCLR / CLIP style).
-    Each batch of B pairs produces a (B, B) similarity matrix; the diagonal
-    entries are positives and all off-diagonal entries are negatives, giving
-    B-1 negatives per positive.  Cross-entropy is computed over rows.
-
-    Optimiser: AdamW with cosine LR decay and linear warmup.
-
-    Usage::
-
-        vocab   = Vocabulary.build_from_nltk()
-        trainer = DualEncoderTrainer(vocab, embed_dim=64)
-        trainer.train_from_nltk(epochs=3)
-        trainer.save_numpy("model.npz")
-
-    The resulting .npz can be loaded with ``DualEncoder.load(path, vocab)``
-    without PyTorch.
-    """
-
-    def _build_model(self, torch, device):
-        vocab_size = self._vocab.size
-        embed_dim = self._embed_dim
-        temperature = self._temperature
-        nn = torch.nn
-
-        class _DualEncoderModel(nn.Module):
-            def __init__(self_):
-                super().__init__()
-                self_.ctx_embed = nn.Embedding(vocab_size, embed_dim)
-                self_.wrd_embed = nn.Embedding(vocab_size, embed_dim)
-                nn.init.xavier_uniform_(self_.ctx_embed.weight)
-                nn.init.xavier_uniform_(self_.wrd_embed.weight)
-
-            def forward(self_, ctx_ids, pos_ids):
-                F = torch.nn.functional
-                # Context vector: mean-pool then L2-normalise → (batch, dim)
-                ctx_vecs = F.normalize(self_.ctx_embed(ctx_ids).mean(1), dim=-1)
-                # Positive word vectors → (batch, dim)
-                pos_vecs = F.normalize(self_.wrd_embed(pos_ids), dim=-1)
-                # (batch, batch) similarity matrix; diagonal = correct pairs
-                return ctx_vecs @ pos_vecs.T / temperature
-
-        model = _DualEncoderModel().to(device)
-        compiled = model
-        if hasattr(torch, "compile"):
-            try:
-                compiled = torch.compile(model, mode="max-autotune")
-            except Exception:
-                pass
-        return model, compiled
-
-    def save_numpy(self, path: str | Path) -> None:
-        """Export trained embeddings to .npz (NumPy format) for inference."""
-        if self._model is None:
-            raise RuntimeError("No trained model — call train_from_* first.")
-        ctx = self._model.ctx_embed.weight.detach().cpu().numpy()
-        wrd = self._model.wrd_embed.weight.detach().cpu().numpy()
-        encoder = DualEncoder(ctx, wrd, self._vocab)
-        encoder.save(path)
-        print(f"Saved model to {path}  ({Path(path).stat().st_size / 1e6:.1f} MB)")
-
-    def get_encoder(self) -> DualEncoder:
-        """Return a DualEncoder with the current trained weights (no file I/O)."""
-        if self._model is None:
-            raise RuntimeError("No trained model — call train_from_* first.")
-        ctx = self._model.ctx_embed.weight.detach().cpu().numpy()
-        wrd = self._model.wrd_embed.weight.detach().cpu().numpy()
-        return DualEncoder(ctx, wrd, self._vocab)
-
-
 # ---------------------------------------------------------------------------
 # CharNgramDualEncoderTrainer
 # ---------------------------------------------------------------------------
 
-class CharNgramDualEncoderTrainer(_BaseTrainer):
-    """Train a CharNgramDualEncoder using in-batch negative sampling.
+class DualEncoderTrainer(_BaseTrainer):
+    """Train a DualEncoder using in-batch negative sampling.
 
-    The training data pipeline is identical to DualEncoderTrainer — the same
-    (context_word_ids, target_word_id) pairs, the same in-batch negatives and
-    cross-entropy loss.  The key architectural difference is in the forward pass:
-    each word ID is first expanded to its character n-gram IDs, then those
-    n-gram embeddings are mean-pooled to produce the word vector.
+    The training data pipeline uses (context_word_ids, target_word_id) pairs,
+    with in-batch negatives and cross-entropy loss.  Words are represented as
+    mean-pooled character n-gram embeddings, decoupling model size from vocab size.
 
     Usage::
 
-        trainer = CharNgramDualEncoderTrainer(vocab, embed_dim=64)
+        trainer = DualEncoderTrainer(vocab, embed_dim=64)
         trainer.train_from_files(corpus_files, epochs=5)
-        trainer.save_numpy("data/model_ngram.npz")
+        trainer.save_numpy("data/model.npz")
     """
 
     def __init__(
@@ -1026,13 +981,13 @@ class CharNgramDualEncoderTrainer(_BaseTrainer):
     def _build_ngram_vocab_if_needed(self) -> None:
         if self._ngram_to_id is not None:
             return
-        from .char_ngram_encoder import build_ngram_vocab
+        from .dual_encoder import build_ngram_vocab
         words = [self._vocab.id_to_word(i) for i in range(self._vocab.size)]
         self._ngram_to_id = build_ngram_vocab(words, ns=self._ns)
 
     def _build_word_ngram_table(self, torch) -> "tuple[torch.Tensor, torch.Tensor]":
         """Precompute a padded (vocab_size, max_ngrams) word→n-gram lookup table."""
-        from .char_ngram_encoder import _char_ngrams
+        from .dual_encoder import _char_ngrams
         vocab_size = self._vocab.size
         ng2id = self._ngram_to_id
 
@@ -1129,10 +1084,10 @@ class CharNgramDualEncoderTrainer(_BaseTrainer):
         """Export trained n-gram embeddings to .npz for inference."""
         if self._model is None:
             raise RuntimeError("No trained model — call train_from_* first.")
-        from .char_ngram_encoder import CharNgramDualEncoder
+        from .dual_encoder import DualEncoder
         ctx = self._model.ctx_embed.weight.detach().cpu().numpy()
         wrd = self._model.wrd_embed.weight.detach().cpu().numpy()
-        encoder = CharNgramDualEncoder(ctx, wrd, self._ngram_to_id, self._vocab, ns=self._ns)
+        encoder = DualEncoder(ctx, wrd, self._ngram_to_id, self._vocab, ns=self._ns)
         encoder.save(path)
         print(f"Saved char-ngram model to {path}  ({Path(path).stat().st_size / 1e6:.1f} MB)")
 
@@ -1140,7 +1095,7 @@ class CharNgramDualEncoderTrainer(_BaseTrainer):
         """Return a CharNgramDualEncoder with the current trained weights."""
         if self._model is None:
             raise RuntimeError("No trained model — call train_from_* first.")
-        from .char_ngram_encoder import CharNgramDualEncoder
+        from .dual_encoder import DualEncoder
         ctx = self._model.ctx_embed.weight.detach().cpu().numpy()
         wrd = self._model.wrd_embed.weight.detach().cpu().numpy()
-        return CharNgramDualEncoder(ctx, wrd, self._ngram_to_id, self._vocab, ns=self._ns)
+        return DualEncoder(ctx, wrd, self._ngram_to_id, self._vocab, ns=self._ns)

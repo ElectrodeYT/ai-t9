@@ -511,11 +511,7 @@ class T9Predictor:
 # ---------------------------------------------------------------------------
 
 def _load_model_auto(path: "str | Path", vocab: Vocabulary) -> "DualEncoder":
-    """Load a DualEncoder or CharNgramDualEncoder by inspecting the .npz file."""
-    arrays = np.load(str(path))
-    if "ngram_keys" in arrays:
-        from .model.char_ngram_encoder import CharNgramDualEncoder
-        return CharNgramDualEncoder.load(path, vocab)
+    """Load a DualEncoder from the .npz file."""
     return DualEncoder.load(path, vocab)
 
 

@@ -78,7 +78,7 @@ Additional options:
 
 ### Train the neural model (optional)
 
-Training produces `model.npz` (dual-encoder embeddings) and optionally
+Training produces `model.npz` (DualEncoder embeddings) and optionally
 `bigram.json` (smoothed bigram counts). Requires the `[train]` extra.
 
 ```bash
@@ -244,7 +244,7 @@ A complete setup uses four files in the `data/` directory:
 |------|----------|-------------|
 | `vocab.json` | `ai-t9-build-vocab` | Word↔ID mapping with frequency counts |
 | `dict.json` | `ai-t9-build-vocab` | Digit-sequence → candidate word index |
-| `model.npz` | `ai-t9-train` | Dual-encoder context/word embeddings (NumPy) |
+| `model.npz` | `ai-t9-train` | DualEncoder context/word embeddings (NumPy) |
 | `bigram.json` | `ai-t9-train --save-ngram` | Smoothed bigram transition counts |
 | `pairs.npz` | `ai-t9-train --save-pairs` | Precomputed (context, target) training pairs |
 
@@ -285,7 +285,7 @@ ai-t9-data fetch-hf-local wikitext wikitext-103-raw-v1 train /data/corpuses/wiki
 - **Inference** is NumPy-only — no PyTorch dependency at runtime.
 - **Training** uses PyTorch with AMP, TF32, and optional CUDA graphs for fast
   GPU training.
-- The **dual-encoder** model learns separate context and word embedding tables.
+- The **DualEncoder** model learns separate context and word embedding tables.
   At inference time, context word embeddings are mean-pooled and compared to
   candidate word embeddings via cosine similarity.
 - **Negative sampling** during training is frequency-weighted (Word2Vec-style

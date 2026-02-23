@@ -1,6 +1,26 @@
 {
     "chat.tools.terminal.autoApprove": {
         ".venv/bin/python": true,
-        "/home/alexander/projects/ai-t9/.venv/bin/python": true
+        "/home/alexander/projects/ai-t9/.venv/bin/python": true,
+        "/^source \\.venv/bin/activate && python -m py_compile src/ai_t9/model/trainer\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^source \\.venv/bin/activate && python -m py_compile src/ai_t9/_scripts/train\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^source \\.venv/bin/activate && python -m py_compile scripts/vast_train\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^source \\.venv/bin/activate && python -m pytest tests/test_t9\\.py::test_dual_encoder -v$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^source \\.venv/bin/activate && python -m pytest tests/test_t9\\.py --collect-only$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
     }
 }

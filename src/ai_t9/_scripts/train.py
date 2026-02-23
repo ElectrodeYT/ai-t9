@@ -84,6 +84,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Output path for model.npz (default: model.npz)",
     )
     parser.add_argument(
+        "--checkpoint",
+        metavar="FILE",
+        default=None,
+        help="Path to save/load training checkpoints (.pth). Saves after each epoch.",
+    )
+    parser.add_argument(
         "--save-ngram",
         metavar="FILE",
         default=None,
@@ -130,13 +136,6 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # ---- Model architecture ---------------------------------------------
-    parser.add_argument(
-        "--model-type",
-        choices=["dual-encoder", "char-ngram"],
-        default="char-ngram",
-        help="Model architecture to train (default: char-ngram, which is more accurate "
-             "but slightly slower than dual-encoder)",
-    )
     parser.add_argument("--embed-dim",      type=int,   default=64,    help="Embedding dimension (default: 64)")
     parser.add_argument("--context-window", type=int,   default=3,     help="Context words to use (default: 3)")
 
@@ -170,18 +169,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from ai_t9.model.vocab import Vocabulary
-    from ai_t9.model.trainer import DualEncoderTrainer, CharNgramDualEncoderTrainer
+    from ai_t9.model.trainer import DualEncoderTrainer
 
-    match args.model_type:
-        case "dual-encoder":
-            print("Selected model type: DualEncoder (word-level)")
-            TrainerCls = DualEncoderTrainer
-        case "char-ngram":
-            print("Selected model type: CharNgramDualEncoder (character n-gram)")
-            TrainerCls = CharNgramDualEncoderTrainer
-        case _:
-            print(f"ERROR: unknown model type: {args.model_type}", file=sys.stderr)
-            return 1
+    TrainerCls = DualEncoderTrainer
 
     # ---- Validate flag combinations ------------------------------------
     if args.pairs_only and not args.save_pairs:
@@ -235,6 +225,11 @@ def main(argv: list[str] | None = None) -> int:
         debug=args.debug,
     )
 
+    # Load checkpoint if exists
+    if args.checkpoint and Path(args.checkpoint).exists():
+        print(f"Loading checkpoint from {args.checkpoint}…")
+        trainer.load_checkpoint(args.checkpoint)
+
     # ---- Train ----------------------------------------------------------
     # corpus_files may be set below; initialize here so the bigram section can
     # always reference it regardless of which training path was taken.
@@ -246,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         if not pairs_dir.is_dir():
             print(f"ERROR: pairs directory not found: {pairs_dir}", file=sys.stderr)
             return 1
-        trainer.train_from_pairs_dir(pairs_dir, epochs=args.epochs, verbose=True)
+        trainer.train_from_pairs_dir(pairs_dir, epochs=args.epochs, verbose=True, checkpoint_path=args.checkpoint)
 
     elif args.load_pairs:
         # Single-file path: skip corpus loading, use precomputed pairs directly.
@@ -254,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         if not pairs_path.exists():
             print(f"ERROR: pairs file not found: {pairs_path}", file=sys.stderr)
             return 1
-        trainer.train_from_pairs_file(pairs_path, epochs=args.epochs, verbose=True)
+        trainer.train_from_pairs_file(pairs_path, epochs=args.epochs, verbose=True, checkpoint_path=args.checkpoint)
 
     else:
         # Corpus path: load sentences, optionally save pairs, optionally train.
@@ -290,7 +285,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             # Train from the just-written file (validates the roundtrip too).
             resolved = pairs_out if str(pairs_out).endswith(".npz") else Path(str(pairs_out) + ".npz")
-            trainer.train_from_pairs_file(resolved, epochs=args.epochs, verbose=True)
+            trainer.train_from_pairs_file(resolved, epochs=args.epochs, verbose=True, checkpoint_path=args.checkpoint)
 
         elif corpus_files:
             trainer.train_from_files(corpus_files, epochs=args.epochs, verbose=True)

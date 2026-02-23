@@ -2,13 +2,9 @@
 """T9 GUI — authentic predictive phone-style text input powered by ai-t9.
 
 Run:
-    # Use pre-built data files (recommended — instant startup):
     python examples/gui_demo.py \\
         --vocab data/vocab.json --dict data/dict.json \\
-        --model data/model.npz --ngram data/bigram.json
-
-    # Fall back to NLTK (downloads ~15 MB on first run):
-    python examples/gui_demo.py
+        --model data/model.npz --ngram data/bigram.npz
 
 Keyboard shortcuts:
     2-9         T9 digit input
@@ -1932,8 +1928,15 @@ def _build_predictor(args):
             ngram_path=args.ngram,
         )
     else:
-        print("Building default predictor from NLTK (first run may download data)…")
-        predictor = T9Predictor.build_default(verbose=True)
+        print(
+            "ERROR: --vocab and --dict are required.\n"
+            "Run the training pipeline first:\n"
+            "  ai-t9-run configs/default.yaml\n"
+            "Then:\n"
+            "  python examples/gui_demo.py --vocab data/vocab.json --dict data/dict.json",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     print("Signals active:")
     for sig, w in predictor.weights.items():
@@ -1947,7 +1950,7 @@ def main() -> int:
     parser.add_argument("--vocab", metavar="FILE", default=None, help="vocab.json path")
     parser.add_argument("--dict",  metavar="FILE", default=None, help="dict.json path")
     parser.add_argument("--model", metavar="FILE", default=None, help="model.npz path (optional)")
-    parser.add_argument("--ngram", metavar="FILE", default=None, help="bigram.json path (optional)")
+    parser.add_argument("--ngram", metavar="FILE", default=None, help="bigram.npz path (optional)")
     parser.add_argument("--top-k", type=int, default=5, help="Candidates to show (default 5)")
     args = parser.parse_args()
 

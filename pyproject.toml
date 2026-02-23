@@ -32,3 +32,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 ai_t9 = ["py.typed"]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning",
+]

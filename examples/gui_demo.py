@@ -1569,6 +1569,16 @@ class T9PhoneWindow(QMainWindow):
                         completions=False,
                     )
                 )
+                if not self._candidates:
+                    self._candidates, self._last_trace = (
+                        self._predictor.predict(
+                            self._digit_buf,
+                            context=self._session.context,
+                            top_k=self._top_k,
+                            trace=True,
+                            completions=True,
+                        )
+                    )
             except ValueError:
                 self._candidates = []
                 self._last_trace = None

@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import math
+import os
+import sys
 from collections import Counter
 
 import numpy as np
 import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from ai_t9.t9_map import (
     T9_MAP,
@@ -1254,10 +1258,10 @@ class TestDualEncoderTrainerSmoke:
 @pytest.mark.skipif(not _TORCH_AVAILABLE, reason="torch not installed")
 class TestCharNgramTrainerSmoke:
     def test_in_batch_negatives_smoke(self, tmp_path, tiny_vocab: Vocabulary, tiny_sentences):
-        from ai_t9.model.trainer import CharNgramDualEncoderTrainer, save_pairs
+        from ai_t9.model.trainer import DualEncoderTrainer, save_pairs
         pairs_path = tmp_path / "pairs.npz"
         save_pairs(tiny_sentences, context_window=2, vocab_size=tiny_vocab.size, path=pairs_path)
-        trainer = CharNgramDualEncoderTrainer(
+        trainer = DualEncoderTrainer(
             vocab=tiny_vocab,
             embed_dim=8,
             context_window=2,
@@ -1268,13 +1272,13 @@ class TestCharNgramTrainerSmoke:
         )
         trainer.train_from_pairs_file(pairs_path, epochs=2, verbose=False)
         encoder = trainer.get_encoder()
-        # Encoder should be a valid CharNgramDualEncoder with pre-computed matrices
+        # Encoder should be a valid DualEncoder with pre-computed matrices
         assert encoder.embed_dim == 8
         assert hasattr(encoder, "_word_matrix")
         assert encoder._word_matrix.shape[0] == tiny_vocab.size
 
     def test_train_from_pairs_dir_smoke(self, tmp_path, tiny_vocab: Vocabulary, tiny_sentences):
-        from ai_t9.model.trainer import CharNgramDualEncoderTrainer, save_pairs
+        from ai_t9.model.trainer import DualEncoderTrainer, save_pairs
         save_pairs(
             tiny_sentences,
             context_window=2,
@@ -1282,7 +1286,7 @@ class TestCharNgramTrainerSmoke:
             path=tmp_path / "pairs",
             max_shard_pairs=3,
         )
-        trainer = CharNgramDualEncoderTrainer(
+        trainer = DualEncoderTrainer(
             vocab=tiny_vocab,
             embed_dim=8,
             context_window=2,

@@ -29,7 +29,7 @@ Two variants cover different network situations:
 
 ``fetch-hf`` — suitable when running locally or on a cheap CPU instance:
   Streams the dataset row-by-row and pushes it to the bucket via a multipart
-  upload using boto3.  Nothing is buffered to disk and RAM usage is ~5 MB
+    upload using boto3.  Nothing is buffered to disk and RAM usage is ~8 MB
   (one S3 part buffer).  Requires the S3 environment variables above.
 
     ai-t9-data fetch-hf wikitext wikitext-103-raw-v1 train corpuses/wiki.txt
@@ -271,24 +271,22 @@ def cmd_fetch_hf(
     upload_id = mpu["UploadId"]
     parts = []
     part_number = 1
-    _MIN_PART = 5 * 1024 * 1024   # S3 minimum: 5 MB per part (except last)
-    buf: list[bytes] = []
-    buf_size = 0
+    # R2 and some S3-compatible providers require all non-final parts to have
+    # exactly the same length.  Emit fixed-size parts and keep only the final
+    # trailing part variable-length.
+    _PART_SIZE = 8 * 1024 * 1024
+    buf = bytearray()
     lines_written = 0
+    completed = False
 
-    def _flush(final: bool = False) -> None:
-        nonlocal part_number, buf_size
-        if not buf:
-            return
-        data = b"".join(buf)
+    def _upload_part(data: bytes) -> None:
+        nonlocal part_number
         resp = client.upload_part(
             Bucket=bucket, Key=remote, UploadId=upload_id,
             PartNumber=part_number, Body=data,
         )
         parts.append({"PartNumber": part_number, "ETag": resp["ETag"]})
         part_number += 1
-        buf.clear()
-        buf_size = 0
 
     try:
         ds = load_dataset(dataset, config, split=split, streaming=True, trust_remote_code=False)
@@ -306,19 +304,31 @@ def cmd_fetch_hf(
             if not line:
                 continue
             encoded = (line + "\n").encode("utf-8")
-            buf.append(encoded)
-            buf_size += len(encoded)
+            buf.extend(encoded)
             lines_written += 1
-            if buf_size >= _MIN_PART:
-                _flush()
+            while len(buf) >= _PART_SIZE:
+                _upload_part(bytes(buf[:_PART_SIZE]))
+                del buf[:_PART_SIZE]
 
-        _flush(final=True)
+        # No lines matched: finish as an empty object (multipart completion with
+        # zero parts is invalid).
+        if lines_written == 0:
+            client.abort_multipart_upload(Bucket=bucket, Key=remote, UploadId=upload_id)
+            client.put_object(Bucket=bucket, Key=remote, Body=b"", ContentType="text/plain; charset=utf-8")
+            if verbose:
+                print(f"  Written 0 lines → {remote}")
+            return 0
+
+        # Upload final trailing part. It may be < 5 MB iff it is the last part.
+        if buf:
+            _upload_part(bytes(buf))
 
         # Complete the multipart upload
         client.complete_multipart_upload(
             Bucket=bucket, Key=remote, UploadId=upload_id,
             MultipartUpload={"Parts": parts},
         )
+        completed = True
         if verbose:
             print(f"  Written {lines_written:,} lines → {remote}")
         return 0
@@ -326,7 +336,8 @@ def cmd_fetch_hf(
     except Exception as exc:
         # Abort on any error to avoid leaving incomplete multipart uploads
         # (they accrue storage charges on most providers).
-        client.abort_multipart_upload(Bucket=bucket, Key=remote, UploadId=upload_id)
+        if not completed:
+            client.abort_multipart_upload(Bucket=bucket, Key=remote, UploadId=upload_id)
         print(f"ERROR: upload aborted: {exc}", file=sys.stderr)
         return 1
 

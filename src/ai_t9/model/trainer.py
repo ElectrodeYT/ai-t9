@@ -754,11 +754,12 @@ class _BaseTrainer:
                     torch.compiler.cudagraph_mark_step_begin()
                 with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                     enabled=amp_dtype is not None):
-                    ctx_vecs, pos_vecs = compiled(ctx_dev[idx], pos_dev[idx])
+                    _pos_batch = pos_dev[idx]
+                    ctx_vecs, pos_vecs = compiled(ctx_dev[idx], _pos_batch)
                     loss = self._objective.compute_loss(
                         ctx_vecs, pos_vecs,
                         embed_fn=embed_fn,
-                        pos_ids=pos_dev[idx],
+                        pos_ids=_pos_batch,
                     ) / self._accumulate
 
                 if scaler is not None:
@@ -1043,11 +1044,12 @@ class _BaseTrainer:
             if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                 torch.compiler.cudagraph_mark_step_begin()
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                ctx_vecs, pos_vecs = compiled(ctx_dev[idx], pos_dev[idx])
+                _pos_batch = pos_dev[idx]
+                ctx_vecs, pos_vecs = compiled(ctx_dev[idx], _pos_batch)
                 loss = self._objective.compute_loss(
                     ctx_vecs, pos_vecs,
                     embed_fn=embed_fn,
-                    pos_ids=pos_dev[idx],
+                    pos_ids=_pos_batch,
                 ) / self._accumulate
 
             if scaler is not None:
@@ -1311,14 +1313,32 @@ class DualEncoderTrainer(_BaseTrainer):
                     self_.wrd_embed.weight[0] = 0
                 self_.register_buffer("_ng_table", ngram_table)
                 self_.register_buffer("_ng_counts", ngram_counts)
+                # Pre-computed position indices — avoids torch.arange() in forward.
+                # persistent=False: deterministic from context_window, not part
+                # of state_dict, so old checkpoints load without errors.
+                self_.register_buffer(
+                    "_slot_ids",
+                    torch.arange(context_window).unsqueeze(0),  # (1, W)
+                    persistent=False,
+                )
 
             def _embed_words(self_, embed_layer, word_ids):
-                """Mean-pool n-gram embeddings, then L2-normalise per word."""
+                """Mean-pool n-gram embeddings, then L2-normalise per word.
+
+                Uses F.embedding_bag to compute the bag sum without
+                materialising the large (n, max_ngrams, dim) intermediate
+                tensor.  This is the dominant memory bottleneck for large
+                negative counts, so eliminating it gives a significant
+                throughput increase.
+                """
                 F = torch.nn.functional
-                ng_ids = self_._ng_table[word_ids]           # (n, max_ngrams)
-                vecs = embed_layer(ng_ids)                    # (n, max_ngrams, dim)
-                counts = self_._ng_counts[word_ids]          # (n, 1)
-                summed = vecs.sum(dim=1)                      # (n, dim)
+                ng_ids = self_._ng_table[word_ids]            # (n, max_ngrams)
+                # Fused sum: avoids creating (n, max_ngrams, dim) tensor.
+                summed = F.embedding_bag(
+                    ng_ids, embed_layer.weight,
+                    mode="sum", padding_idx=0,
+                )                                             # (n, dim)
+                counts = self_._ng_counts[word_ids]           # (n, 1)
                 return F.normalize(summed / counts, dim=-1)   # (n, dim)
 
             def embed_tgt_words(self_, word_ids):
@@ -1340,11 +1360,8 @@ class DualEncoderTrainer(_BaseTrainer):
                     self_.ctx_embed, flat_ctx
                 ).reshape(batch, context_window, embed_dim)          # (B, W, dim)
 
-                # 2. Add positional embeddings.
-                slot_ids = torch.arange(
-                    context_window, device=ctx_ids.device
-                ).unsqueeze(0)                                       # (1, W)
-                pos_vecs_ctx = self_.pos_embed(slot_ids)             # (1, W, dim)
+                # 2. Add positional embeddings (slot_ids is a pre-built buffer).
+                pos_vecs_ctx = self_.pos_embed(self_._slot_ids)      # (1, W, dim)
                 ctx_input = ctx_word_vecs + pos_vecs_ctx             # (B, W, dim)
 
                 # 3. Mask padding positions (word_id == 0 → zero vector).

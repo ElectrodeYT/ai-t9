@@ -196,35 +196,33 @@ class SGNSObjective(TrainingObjective):
             and pos_ids is not None
             and self._k_hard > 0
         ):
-            # Hard negatives: sample from T9 sibling table
-            # Random column indices to pick from each word's sibling pool
+            # Single multinomial for all random IDs: k_hard fallbacks + k_rand negatives.
+            # Avoids a second kernel launch and keeps all random state on the GPU.
+            all_rand_ids = torch.multinomial(
+                self._neg_weights, B * self._k, replacement=True,
+            )                                                               # (B*k,)
+            fallback_ids = all_rand_ids[: B * self._k_hard].reshape(
+                B, self._k_hard
+            )                                                               # (B, k_hard)
+            rand_neg_ids = all_rand_ids[B * self._k_hard :]                # (B*k_rand,)
+
+            # Hard negatives via sibling table; torch.where avoids a CPU-GPU
+            # sync (.item()) and preserves a single continuous compute graph.
             col_idx = torch.randint(
                 self._max_sib, (B, self._k_hard), device=pos_ids.device
             )
-            hard_neg_ids = self._sibling_table[pos_ids].gather(1, col_idx)  # (B, k_hard)
+            sib_ids = self._sibling_table[pos_ids].gather(1, col_idx)      # (B, k_hard)
+            no_sib = ~self._has_siblings[pos_ids]                          # (B,)
+            hard_neg_ids = torch.where(
+                no_sib.unsqueeze(1), fallback_ids, sib_ids
+            )                                                               # (B, k_hard)
 
-            # Replace hard negs for words that have no siblings with random draws
-            no_sib = ~self._has_siblings[pos_ids]                           # (B,)
-            if no_sib.any():
-                n_fill = int(no_sib.sum().item())
-                fallback = torch.multinomial(
-                    self._neg_weights, n_fill * self._k_hard, replacement=True,
-                ).reshape(n_fill, self._k_hard)
-                hard_neg_ids[no_sib] = fallback
-
-            hard_neg_vecs = embed_fn(hard_neg_ids.reshape(-1)).reshape(
-                B, self._k_hard, dim
-            )                                                               # (B, k_hard, dim)
-
-            # Random negatives for remaining slots
-            rand_neg_ids = torch.multinomial(
-                self._neg_weights, B * self._k_rand, replacement=True,
-            )                                                               # (B*k_rand,)
-            rand_neg_vecs = embed_fn(rand_neg_ids).reshape(
-                B, self._k_rand, dim
-            )                                                               # (B, k_rand, dim)
-
-            neg_vecs = torch.cat([hard_neg_vecs, rand_neg_vecs], dim=1)    # (B, k, dim)
+            # Single embed_fn call for all B*k negatives — avoids running
+            # the n-gram composition kernel twice on split ID sets.
+            all_neg_ids = torch.cat(
+                [hard_neg_ids.reshape(-1), rand_neg_ids]
+            )                                                               # (B*k,)
+            neg_vecs = embed_fn(all_neg_ids).reshape(B, self._k, dim)      # (B, k, dim)
         else:
             # Standard random negatives only
             neg_ids = torch.multinomial(

@@ -50,7 +50,7 @@ Conventions for bucket layout::
     vocab/        vocab.json artifacts
     pairs/        precomputed training pairs  (*.npz, from ai-t9-train --save-pairs)
     models/       trained model weights  (*.npz)
-    ngrams/       bigram models  (*.json)
+    dictionaries/ word list files  (*.txt)
 
 Install the required extra before using::
 

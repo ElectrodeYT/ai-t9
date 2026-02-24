@@ -34,6 +34,7 @@ training:
   min_lr_frac: 0.01
   objective: "sgns"
   n_negatives: 15
+  hard_neg_frac: 0.5
   batch_size: 0
   accumulate_grad_batches: 4
   clip_grad_norm: 1.0
@@ -44,7 +45,6 @@ training:
 # Only run the train step — vocab/pairs are downloaded from S3
 # ---------------------------------------------------------------------------
 output_dir: "data"
-ngram: false
 
 steps:
   - train
@@ -60,8 +60,8 @@ s3:
   region:     "auto"
   upload: true
   paths:
-    vocab:  "vocab/vocab.json"
-    dict:   "vocab/dict.json"
-    pairs:  "pairs/"
-    model:  "models/model.npz"
-    ngram:  "ngrams/bigram.npz"
+    vocab:        "vocab/vocab.json"
+    dict:         "vocab/dict.json"
+    pairs:        "pairs/"
+    model:        "models/model.npz"
+    dictionary:   "dictionaries/words_alpha.txt"

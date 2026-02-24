@@ -4,7 +4,7 @@
 Run:
     python examples/gui_demo.py \\
         --vocab data/vocab.json --dict data/dict.json \\
-        --model data/model.npz --ngram data/bigram.npz
+        --model data/model.npz
 
 Keyboard shortcuts:
     2-9         T9 digit input
@@ -422,7 +422,7 @@ class DebugWindow(QWidget):
 
     Six tabs:
     • Scores    — per-candidate score table with visual bars for every signal
-    • Pipeline  — step-by-step trace: dict lookup → freq → model → ngram → blend
+    • Pipeline  — step-by-step trace: dict lookup → freq → model → blend
     • Config    — predictor weights, vocabulary size, active signals
     • Log       — rolling history of digit sequences and confirmed words
     • Perf      — per-call latency breakdown with running stats (last 50 predictions)
@@ -473,14 +473,14 @@ class DebugWindow(QWidget):
         hdr.setStyleSheet(f"color:{C['status_text']};font-size:11px;")
         score_lay.addWidget(hdr)
 
-        self._score_table = QTableWidget(0, 6)
+        self._score_table = QTableWidget(0, 5)
         self._score_table.setHorizontalHeaderLabels(
-            ["Word", "freq (raw)", "freq ▪", "model ▪", "ngram ▪", "final ▪"]
+            ["Word", "freq (raw)", "freq ▪", "model ▪", "final ▪"]
         )
         self._score_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
         )
-        for col in range(1, 6):
+        for col in range(1, 5):
             self._score_table.horizontalHeader().setSectionResizeMode(
                 col, QHeaderView.ResizeMode.Stretch
             )
@@ -587,7 +587,6 @@ class DebugWindow(QWidget):
         freq_raw  = trace["freq_raw"]
         freq_norm = trace["freq_norm"]
         model_norm = trace["model_norm"]
-        ngram_norm = trace["ngram_norm"]
         final      = trace["final"]
         order      = trace["order"]
         n = len(words_raw)
@@ -625,15 +624,9 @@ class DebugWindow(QWidget):
                 rank, 3,
                 self._bar_item(mv, "#cc8844") if mv >= 0 else self._na_item()
             )
-            # ngram bar
-            nv = float(ngram_norm[i]) if ngram_norm is not None else -1.0
-            self._score_table.setItem(
-                rank, 4,
-                self._bar_item(nv, "#44aa77") if nv >= 0 else self._na_item()
-            )
             # final bar
             self._score_table.setItem(
-                rank, 5,
+                rank, 4,
                 self._bar_item(float(final[i]), C["display_active"])
             )
 
@@ -751,43 +744,12 @@ class DebugWindow(QWidget):
             lines.append("</table>")
         lines.append("")
 
-        # ── 4. Ngram scoring ──────────────────────────────────────────
-        lines.append(_h("Stage 4 · ngram score (bigram)", "#44aa77"))
-        if trace["ngram_raw"] is None:
-            reason = (
-                "Ngram not loaded — signal disabled."
-                if not self._predictor.has_ngram
-                else "No context words yet — ngram requires ≥1 prior word."
-            )
-            lines.append(f'<span style="color:#565a6e">{reason}</span>')
-        else:
-            lines.append(
-                _kv("weight", f'{trace["weights"]["ngram"]:.3f}', C["cand_text"])
-            )
-            prev = trace["context"][-1] if trace["context"] else "—"
-            lines.append(_kv("prev word (P·context)", prev, "#9898b8"))
-            lines.append("<table cellpadding='1' cellspacing='0'>")
-            for rank, i in enumerate(order[:6]):
-                w, _ = words_raw[i]
-                raw  = float(trace["ngram_raw"][i])
-                norm = float(trace["ngram_norm"][i])
-                lines.append(
-                    f"<tr>"
-                    f'<td style="color:{C["cand_text"]};width:80px">{w}</td>'
-                    f'<td style="color:#666;width:70px">{raw:.4f}</td>'
-                    f"<td>{_bar_html(norm, '#44aa77')}</td>"
-                    f"</tr>"
-                )
-            lines.append("</table>")
-        lines.append("")
-
-        # ── 5. Final blend ────────────────────────────────────────────
-        lines.append(_h("Stage 5 · final blend", C["display_active"]))
+        # ── 4. Final blend ────────────────────────────────────────────
+        lines.append(_h("Stage 4 · final blend", C["display_active"]))
         w = trace["weights"]
         lines.append(
             _kv("formula",
-                f'{w["freq"]:.3f}·freq + {w["model"]:.3f}·model '
-                f'+ {w["ngram"]:.3f}·ngram',
+                f'{w["freq"]:.3f}·freq + {w["model"]:.3f}·model',
                 "#9898b8")
         )
         lines.append("<table cellpadding='1' cellspacing='0'>")
@@ -835,17 +797,7 @@ class DebugWindow(QWidget):
         lines.append(_kv("model",
                          "dual-encoder (npz)" if p.has_model else "not loaded",
                          "#cc8844" if p.has_model else C["status_text"]))
-        lines.append(_kv("ngram",
-                         "bigram (add-k smoothed)" if p.has_ngram else "not loaded",
-                         "#44aa77" if p.has_ngram else C["status_text"]))
         lines.append("")
-
-        if p.has_ngram:
-            lines.append(_h("Bigram scorer"))
-            ng = p._ngram
-            lines.append(_kv("smoothing k", str(ng._k)))
-            lines.append(_kv("vocab size", str(ng._vocab.size)))
-            lines.append(_kv("unique prev-words seen", str(ng.n_unique_contexts)))
 
         if p.has_model:
             lines.append("")
@@ -922,7 +874,6 @@ class DebugWindow(QWidget):
             ("dict",  "dict",   "#4488cc"),
             ("freq",  "freq",   "#6688aa"),
             ("model", "model",  "#cc8844"),
-            ("ngram", "ngram",  "#44aa77"),
             ("blend", "blend",  "#888888"),
         ]
 
@@ -1025,13 +976,8 @@ class DebugWindow(QWidget):
              "Rank-normalised cosine similarity between the context embedding "
              "and this word\u2019s embedding. Shows n/a when no model is loaded.",
              ORANGE),
-            ("ngram \u25aa",
-             "Rank-normalised bigram log-probability given the immediately "
-             "preceding confirmed word. Shows n/a when no ngram model is loaded "
-             "or no prior context exists yet.",
-             GREEN),
             ("final \u25aa",
-             "Weighted blend: w_freq\u00b7freq + w_model\u00b7model + w_ngram\u00b7ngram. "
+             "Weighted blend: w_freq\u00b7freq + w_model\u00b7model. "
              "Higher = ranked first in the candidate bar.",
              TEAL),
         ]))
@@ -1046,19 +992,14 @@ class DebugWindow(QWidget):
              DIM),
             ("Stage 2 \u00b7 freq",
              "Log-frequency from the vocabulary. Always active. Acts as the "
-             "sole tiebreaker when model and ngram are both absent or zero-weighted.",
+             "sole tiebreaker when model is absent or zero-weighted.",
              BLUE),
             ("Stage 3 \u00b7 model",
-             "Context-aware reranking via the dual-encoder. The context vector is "
-             "the mean embedding of recently confirmed words. Scores are cosine "
-             "similarities. Disabled until context exists or if no model is loaded.",
+             "Context-aware reranking via the dual-encoder GRU. The context vector is "
+             "computed by a GRU over positionally-embedded context words. Scores are "
+             "cosine similarities. Disabled when no model is loaded.",
              ORANGE),
-            ("Stage 4 \u00b7 ngram",
-             "Bigram language model (add-k smoothed). Uses only the single "
-             "immediately preceding word. Disabled until at least one word has "
-             "been confirmed, or when no ngram file is loaded.",
-             GREEN),
-            ("Stage 5 \u00b7 blend",
+            ("Stage 4 \u00b7 blend",
              "Weighted sum of rank-normalised signals. Inactive signals contribute 0; "
              "remaining weights are auto-renormalised so they always sum to 1.",
              TEAL),
@@ -1092,10 +1033,6 @@ class DebugWindow(QWidget):
              "Typically 0\u20132\u2009ms on CPU for embed_dim \u2264 300. "
              "Zero when the model signal is disabled.",
              ORANGE),
-            ("ngram",
-             "Sparse CSR row-slice + binary search over candidates. "
-             "Near-instant. Zero when the ngram signal is disabled.",
-             GREEN),
             ("blend",
              "Weighted sum + argsort. O(n log n) but n is small so near-instant.",
              DIM),
@@ -1129,7 +1066,7 @@ class DebugWindow(QWidget):
         sections.append(_h("Quick diagnostics"))
         sections.append(_bullets([
             ("Signal shows n/a",
-             "The artifact was not loaded (check --model / --ngram flags) "
+             "The artifact was not loaded (check --model flag) "
              "or the signal has weight 0.",
              DIM),
             ("Wrong word ranked first",
@@ -1850,7 +1787,6 @@ class T9PhoneWindow(QMainWindow):
                         tip = (
                             f"freq={c.freq_score:.3f}  "
                             f"model={c.model_score:.3f}  "
-                            f"ngram={c.ngram_score:.3f}  "
                             f"final={c.final_score:.3f}"
                         )
                     else:
@@ -1925,7 +1861,6 @@ def _build_predictor(args):
             vocab_path=args.vocab,
             dict_path=args.dict,
             model_path=args.model,
-            ngram_path=args.ngram,
         )
     else:
         print(
@@ -1950,7 +1885,6 @@ def main() -> int:
     parser.add_argument("--vocab", metavar="FILE", default=None, help="vocab.json path")
     parser.add_argument("--dict",  metavar="FILE", default=None, help="dict.json path")
     parser.add_argument("--model", metavar="FILE", default=None, help="model.npz path (optional)")
-    parser.add_argument("--ngram", metavar="FILE", default=None, help="bigram.npz path (optional)")
     parser.add_argument("--top-k", type=int, default=5, help="Candidates to show (default 5)")
     args = parser.parse_args()
 

@@ -756,7 +756,9 @@ class _BaseTrainer:
                                     enabled=amp_dtype is not None):
                     ctx_vecs, pos_vecs = compiled(ctx_dev[idx], pos_dev[idx])
                     loss = self._objective.compute_loss(
-                        ctx_vecs, pos_vecs, embed_fn=embed_fn,
+                        ctx_vecs, pos_vecs,
+                        embed_fn=embed_fn,
+                        pos_ids=pos_dev[idx],
                     ) / self._accumulate
 
                 if scaler is not None:
@@ -1043,7 +1045,9 @@ class _BaseTrainer:
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
                 ctx_vecs, pos_vecs = compiled(ctx_dev[idx], pos_dev[idx])
                 loss = self._objective.compute_loss(
-                    ctx_vecs, pos_vecs, embed_fn=embed_fn,
+                    ctx_vecs, pos_vecs,
+                    embed_fn=embed_fn,
+                    pos_ids=pos_dev[idx],
                 ) / self._accumulate
 
             if scaler is not None:
@@ -1095,16 +1099,17 @@ class DualEncoderTrainer(_BaseTrainer):
     Words are represented as mean-pooled character n-gram embeddings,
     decoupling model size from vocab size.
 
-    The training objective is configurable:
+    The context encoder is a GRU (hidden_size = embed_dim) with per-slot
+    positional embeddings added to the word embeddings before the GRU.  This
+    replaces the old mean-pooling encoder.
 
-    - ``"sgns"`` (default): Skip-Gram Negative Sampling — O(B×k), fast and
-      well-suited for word embedding quality.
-    - ``"clip"``: CLIP-style in-batch negatives — O(B²), useful for research.
-    - Any :class:`TrainingObjective` instance for custom objectives.
+    When the ``"sgns"`` objective is selected, T9 ambiguity groups are
+    precomputed from the vocabulary and supplied as hard negatives, directly
+    training the model to discriminate between T9-ambiguous words.
 
     Usage::
 
-        trainer = DualEncoderTrainer(vocab, embed_dim=64)
+        trainer = DualEncoderTrainer(vocab, embed_dim=128)
         trainer.train_from_files(corpus_files, epochs=5)
         trainer.save_numpy("data/model.npz")
     """
@@ -1127,6 +1132,7 @@ class DualEncoderTrainer(_BaseTrainer):
         ns: tuple[int, ...] = (2, 3),
         objective: str | TrainingObjective = "sgns",
         n_negatives: int = 15,
+        hard_neg_frac: float = 0.5,
         temperature: float = 0.07,
     ) -> None:
         super().__init__(
@@ -1138,7 +1144,9 @@ class DualEncoderTrainer(_BaseTrainer):
         self._ngram_to_id: dict[str, int] | None = None
         self._objective_spec = objective
         self._n_negatives = n_negatives
+        self._hard_neg_frac = hard_neg_frac
         self._temperature = temperature
+        self._t9_groups: "dict[int, list[int]] | None" = None
 
     # ------------------------------------------------------------------
     # Hooks
@@ -1146,12 +1154,53 @@ class DualEncoderTrainer(_BaseTrainer):
 
     def _before_training(self) -> None:
         self._build_ngram_vocab_if_needed()
+        self._build_t9_groups_if_needed()
         self._build_objective_if_needed()
 
     def _verbose_extra_fields(self) -> dict[str, object]:
         if self._ngram_to_id is None:
             return {}
         return {"n_ngrams": len(self._ngram_to_id) + 1}
+
+    # ------------------------------------------------------------------
+    # T9 hard negative groups
+    # ------------------------------------------------------------------
+
+    def _build_t9_groups_if_needed(self) -> None:
+        """Precompute T9 ambiguity groups for hard negative mining.
+
+        Groups map each word_id to the list of other word_ids that share the
+        same T9 digit sequence (e.g. "home", "good", "gone", "hood" all map
+        to "4663").  Passed to SGNSObjective so that half the negatives per
+        positive are drawn from the target's T9 siblings.
+        """
+        if self._t9_groups is not None:
+            return
+        from ..t9_map import word_to_digits
+
+        digit_to_wids: dict[str, list[int]] = {}
+        for wid in range(1, self._vocab.size):  # skip UNK (id 0)
+            word = self._vocab.id_to_word(wid)
+            digits = word_to_digits(word)
+            if digits is None:
+                continue
+            if digits not in digit_to_wids:
+                digit_to_wids[digits] = []
+            digit_to_wids[digits].append(wid)
+
+        t9_groups: dict[int, list[int]] = {}
+        for wids in digit_to_wids.values():
+            if len(wids) < 2:
+                continue
+            for wid in wids:
+                t9_groups[wid] = [w for w in wids if w != wid]
+
+        n_ambiguous = sum(1 for v in t9_groups.values() if v)
+        print(
+            f"  T9 hard negatives: {n_ambiguous:,} words have ambiguous T9 siblings "
+            f"(hard_neg_frac={self._hard_neg_frac})"
+        )
+        self._t9_groups = t9_groups
 
     # ------------------------------------------------------------------
     # Objective building
@@ -1170,6 +1219,8 @@ class DualEncoderTrainer(_BaseTrainer):
             self._objective = SGNSObjective(
                 counts=self._vocab._counts,
                 k=self._n_negatives,
+                t9_groups=self._t9_groups,
+                hard_neg_frac=self._hard_neg_frac,
             )
         elif spec == "clip":
             self._objective = CLIPObjective(temperature=self._temperature)
@@ -1235,13 +1286,26 @@ class DualEncoderTrainer(_BaseTrainer):
 
         nn = torch.nn
 
+        context_window = self._context_window
+
         class _CharNgramModel(nn.Module):
             def __init__(self_):
                 super().__init__()
                 self_.ctx_embed = nn.Embedding(n_ngrams, embed_dim, padding_idx=0)
                 self_.wrd_embed = nn.Embedding(n_ngrams, embed_dim, padding_idx=0)
+                # Positional embeddings: one vector per context slot.
+                self_.pos_embed = nn.Embedding(context_window, embed_dim)
+                # GRU context encoder: hidden_size = embed_dim.
+                self_.gru = nn.GRU(embed_dim, embed_dim, batch_first=True)
                 nn.init.xavier_uniform_(self_.ctx_embed.weight)
                 nn.init.xavier_uniform_(self_.wrd_embed.weight)
+                nn.init.xavier_uniform_(self_.pos_embed.weight)
+                # Orthogonal init for GRU is a common best practice.
+                for name, p in self_.gru.named_parameters():
+                    if "weight" in name:
+                        nn.init.orthogonal_(p)
+                    elif "bias" in name:
+                        nn.init.zeros_(p)
                 with torch.no_grad():
                     self_.ctx_embed.weight[0] = 0
                     self_.wrd_embed.weight[0] = 0
@@ -1258,29 +1322,43 @@ class DualEncoderTrainer(_BaseTrainer):
                 return F.normalize(summed / counts, dim=-1)   # (n, dim)
 
             def embed_tgt_words(self_, word_ids):
-                """Embed word IDs through the target (word) embedding table.
-
-                This is used by objectives that need to score additional words
-                (e.g. SGNS negative sampling).  Uses the same n-gram mean-pool
-                + L2-normalise path as the forward pass.
-                """
+                """Embed word IDs through the target (word) embedding table."""
                 return self_._embed_words(self_.wrd_embed, word_ids)
 
             def forward(self_, ctx_ids, pos_ids):
+                """
+                ctx_ids : (batch, context_window) int — word IDs, 0 = padding
+                pos_ids : (batch,) int — target word IDs
+                """
                 F = torch.nn.functional
                 batch = ctx_ids.size(0)
 
-                # Context: embed each word, mean-pool across context window, normalise.
-                flat_ctx = ctx_ids.reshape(-1)
+                # ── Context encoding ──────────────────────────────────
+                # 1. Embed each context word (L2-normalised per word).
+                flat_ctx = ctx_ids.reshape(-1)                       # (B*W,)
                 ctx_word_vecs = self_._embed_words(
                     self_.ctx_embed, flat_ctx
-                ).reshape(batch, -1, embed_dim)
-                ctx_vecs = F.normalize(ctx_word_vecs.mean(1), dim=-1)   # (batch, dim)
+                ).reshape(batch, context_window, embed_dim)          # (B, W, dim)
 
-                # Positive: embed target words, normalise.
-                pos_vecs = self_._embed_words(self_.wrd_embed, pos_ids)  # (batch, dim)
+                # 2. Add positional embeddings.
+                slot_ids = torch.arange(
+                    context_window, device=ctx_ids.device
+                ).unsqueeze(0)                                       # (1, W)
+                pos_vecs_ctx = self_.pos_embed(slot_ids)             # (1, W, dim)
+                ctx_input = ctx_word_vecs + pos_vecs_ctx             # (B, W, dim)
 
-                return ctx_vecs, pos_vecs
+                # 3. Mask padding positions (word_id == 0 → zero vector).
+                pad_mask = (ctx_ids != 0).float().unsqueeze(-1)      # (B, W, 1)
+                ctx_input = ctx_input * pad_mask                     # (B, W, dim)
+
+                # 4. GRU: use final hidden state as context vector.
+                _, h_n = self_.gru(ctx_input)                        # h_n: (1, B, dim)
+                ctx_vecs = F.normalize(h_n.squeeze(0), dim=-1)       # (B, dim)
+
+                # ── Positive word embedding ───────────────────────────
+                pos_word_vecs = self_._embed_words(self_.wrd_embed, pos_ids)  # (B, dim)
+
+                return ctx_vecs, pos_word_vecs
 
         model = _CharNgramModel().to(device)
         compiled = model
@@ -1301,21 +1379,49 @@ class DualEncoderTrainer(_BaseTrainer):
     # ------------------------------------------------------------------
 
     def save_numpy(self, path) -> None:
-        """Export trained n-gram embeddings to .npz for inference."""
+        """Export trained weights to .npz for NumPy inference."""
         if self._model is None:
             raise RuntimeError("No trained model — call train_from_* first.")
         from .dual_encoder import DualEncoder
-        ctx = self._model.ctx_embed.weight.detach().cpu().numpy()
-        wrd = self._model.wrd_embed.weight.detach().cpu().numpy()
-        encoder = DualEncoder(ctx, wrd, self._ngram_to_id, self._vocab, ns=self._ns)
+        m = self._model
+        ctx = m.ctx_embed.weight.detach().cpu().numpy()
+        wrd = m.wrd_embed.weight.detach().cpu().numpy()
+        gru_weights = (
+            m.gru.weight_ih_l0.detach().cpu().numpy(),
+            m.gru.weight_hh_l0.detach().cpu().numpy(),
+            m.gru.bias_ih_l0.detach().cpu().numpy(),
+            m.gru.bias_hh_l0.detach().cpu().numpy(),
+        )
+        pos_embed = m.pos_embed.weight.detach().cpu().numpy()
+        encoder = DualEncoder(
+            ctx, wrd, self._ngram_to_id, self._vocab,
+            ns=self._ns,
+            gru_weights=gru_weights,
+            pos_embed=pos_embed,
+            context_window=self._context_window,
+        )
         encoder.save(path)
-        print(f"Saved char-ngram model to {path}  ({Path(path).stat().st_size / 1e6:.1f} MB)")
+        print(f"Saved model to {path}  ({Path(path).stat().st_size / 1e6:.1f} MB)")
 
     def get_encoder(self):
-        """Return a CharNgramDualEncoder with the current trained weights."""
+        """Return a DualEncoder with the current trained weights."""
         if self._model is None:
             raise RuntimeError("No trained model — call train_from_* first.")
         from .dual_encoder import DualEncoder
-        ctx = self._model.ctx_embed.weight.detach().cpu().numpy()
-        wrd = self._model.wrd_embed.weight.detach().cpu().numpy()
-        return DualEncoder(ctx, wrd, self._ngram_to_id, self._vocab, ns=self._ns)
+        m = self._model
+        ctx = m.ctx_embed.weight.detach().cpu().numpy()
+        wrd = m.wrd_embed.weight.detach().cpu().numpy()
+        gru_weights = (
+            m.gru.weight_ih_l0.detach().cpu().numpy(),
+            m.gru.weight_hh_l0.detach().cpu().numpy(),
+            m.gru.bias_ih_l0.detach().cpu().numpy(),
+            m.gru.bias_hh_l0.detach().cpu().numpy(),
+        )
+        pos_embed = m.pos_embed.weight.detach().cpu().numpy()
+        return DualEncoder(
+            ctx, wrd, self._ngram_to_id, self._vocab,
+            ns=self._ns,
+            gru_weights=gru_weights,
+            pos_embed=pos_embed,
+            context_window=self._context_window,
+        )

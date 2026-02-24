@@ -9,9 +9,6 @@ Usage::
     # Train on a folder of corpus files (all *.txt files are combined)
     ai-t9-train --vocab data/vocab.json --corpus corpuses/ --output data/model.npz
 
-    # Also export a bigram model for the ngram signal
-    ai-t9-train --vocab data/vocab.json --output data/model.npz --save-ngram data/bigram.npz
-
     # Precompute pairs once (CPU job) and save for later GPU training runs:
     ai-t9-train --vocab data/vocab.json --corpus corpuses/ \\
                 --save-pairs data/pairs.npz --pairs-only
@@ -163,13 +160,6 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Path to save/load training checkpoints (.pth). Saves after each epoch.",
     )
-    parser.add_argument(
-        "--save-ngram",
-        metavar="FILE",
-        default=None,
-        help="If given, also save a trained bigram model to this path.",
-    )
-
     # ---- Pairs precomputation / loading ----------------------------------
     parser.add_argument(
         "--save-pairs",
@@ -321,8 +311,6 @@ def main(argv: list[str] | None = None) -> int:
         trainer.load_checkpoint(args.checkpoint)
 
     # ---- Train ----------------------------------------------------------
-    # corpus_files may be set below; initialize here so the bigram section can
-    # always reference it regardless of which training path was taken.
     corpus_files = None
     hf_sentences = None
 
@@ -393,24 +381,6 @@ def main(argv: list[str] | None = None) -> int:
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     trainer.save_numpy(out_path)
-
-    # ---- Optionally train bigram model -----------------------------------
-    if args.save_ngram:
-        from ai_t9.ngram import BigramScorer
-        from ai_t9.model.trainer import _corpus_file_sentence_ids
-        print("Training bigram model…")
-        if not corpus_files:
-            print("ERROR: --save-ngram requires --corpus to be specified", file=sys.stderr)
-            return 1
-        scorer = BigramScorer(vocab)
-        for path in corpus_files:
-            sents = _corpus_file_sentence_ids(path, vocab)
-            for sent in sents:
-                scorer.train_on_ids(sent)
-        ngram_path = Path(args.save_ngram)
-        ngram_path.parent.mkdir(parents=True, exist_ok=True)
-        actual_ngram_path = scorer.save(ngram_path)
-        print(f"Saved bigram model → {actual_ngram_path}")
 
     return 0
 

@@ -1,29 +1,37 @@
 """DualEncoder: open-vocabulary context-aware word scorer.
 
-This is the CharNgramDualEncoder implementation, which decouples model size from
-vocabulary size and eliminates the need to retrain when new words are added to
-the T9 dictionary.
-
 Architecture
 ------------
-Instead of a per-word-ID embedding lookup table, words are represented as the
-**mean of their character n-gram embeddings** (fastText-style).  The model
-stores two embedding matrices indexed by character n-gram ID rather than word ID:
+Words are represented as the **mean of their character n-gram embeddings**
+(fastText-style), decoupling model size from vocabulary size.  The model
+stores two embedding matrices indexed by character n-gram ID:
 
     ctx_embeds[ngram_id]  — how ngram_id looks in context (preceding words)
     wrd_embeds[ngram_id]  — how ngram_id looks as a target word
 
-At load time, both matrices are expanded into dense per-word vectors for all
-vocab words, stored as ``_ctx_matrix`` and ``_word_matrix``.  At inference:
+Context encoding — GRU with positional embeddings
+--------------------------------------------------
+The context window is encoded by a small GRU rather than plain mean pooling.
+This captures word order (``"going to ___"`` differs from ``"to going ___"``)
+and sequential dependencies that mean pooling discards.
 
-    ctx_vec  = normalise(mean(_ctx_matrix[context_ids]))   # (dim,)
-    scores   = _word_matrix[candidate_ids] @ ctx_vec       # (n_cands,)
+Before the GRU, each context word embedding has a learned **positional
+embedding** added to it, giving the GRU an explicit signal about each word's
+position in the window (oldest → most-recent).  Padding positions (word_id=0)
+are masked out before being fed to the GRU.
 
-This pre-computation makes scoring as fast as the old DualEncoder (single matmul) while
-keeping the model size small (n_ngrams × dim instead of vocab_size × dim).
+The GRU is a standard single-layer GRU (PyTorch convention) with
+hidden_size = embed_dim.  Its weights are stored alongside the n-gram
+embeddings in the .npz file and executed in pure NumPy at inference:
 
-Open-vocabulary scoring of OOV words is still available via ``score_word()``,
-which uses the raw ngram embeddings directly.
+    σ(x)     = 1 / (1 + exp(-x))
+    r_t = σ(W_ir x_t + b_ir + W_hr h_{t−1} + b_hr)
+    z_t = σ(W_iz x_t + b_iz + W_hz h_{t−1} + b_hz)
+    n_t = tanh(W_in x_t + b_in + r_t * (W_hn h_{t−1} + b_hn))
+    h_t = (1 − z_t) * n_t + z_t * h_{t−1}
+
+At load time, n-gram matrices are expanded into dense (vocab_size, dim)
+per-word vectors for fast candidate scoring (single matmul at inference).
 
 N-gram vocabulary
 -----------------
@@ -32,22 +40,12 @@ fastText convention.  For example ``"the"`` produces:
     2-grams: ``<t``, ``th``, ``he``, ``e>``
     3-grams: ``<th``, ``the``, ``he>``
 
-The n-gram vocabulary is built once at training time from the word corpus and
-saved alongside the embeddings in the .npz file.  Its size is fixed and grows
-very slowly (new English words almost never introduce new bigrams/trigrams).
-
-Size comparison (dim=264, vocab_size=29,470)
+Size comparison (dim=128, vocab_size=29,470)
 --------------------------------------------
-    Old DualEncoder       :  29,470 × 264 × 2 × 4 B  ≈  62 MB RAM
-    New DualEncoder       :   8,734 × 264 × 2 × 4 B  ≈  18 MB (ngram mats)
-                           + 29,470 × 264 × 2 × 4 B  ≈  62 MB (pre-computed)
-
-For mobile targets use dim=64-96 to keep the pre-computed matrices small.
-
-Interface
----------
-The public interface is identical to the old DualEncoder so T9Predictor requires no
-changes — just load a DualEncoder instead.
+    n-gram mats  :   8,734 × 128 × 2 × 4 B  ≈   9 MB
+    pre-computed :  29,470 × 128 × 2 × 4 B  ≈  30 MB
+    GRU weights  :   4 × (3×128×128) × 4 B  ≈   0.8 MB
+    pos_embed    :        window × 128 × 4 B  ≈  negligible
 """
 
 from __future__ import annotations
@@ -63,8 +61,15 @@ import numpy as np
 from .vocab import Vocabulary
 
 
-# Constants from char_ngram_encoder.py
 _UNK_NGRAM_ID = 0
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x.astype(np.float32)))
 
 
 def _char_ngrams(word: str, ns: tuple[int, ...]) -> list[str]:
@@ -79,24 +84,26 @@ def _char_ngrams(word: str, ns: tuple[int, ...]) -> list[str]:
 
 def build_ngram_vocab(words: list[str], ns: tuple[int, ...] = (2, 3)) -> dict[str, int]:
     """Build n-gram vocabulary from a list of words."""
-    ngram_to_id = {}
+    ngram_to_id: dict[str, int] = {}
     for word in words:
         for gram in _char_ngrams(word, ns):
             if gram not in ngram_to_id:
-                ngram_to_id[gram] = len(ngram_to_id) + 1  # Start from 1, 0 is UNK
+                ngram_to_id[gram] = len(ngram_to_id) + 1  # 0 is reserved for UNK
     return ngram_to_id
 
 
+# ---------------------------------------------------------------------------
+# DualEncoder
+# ---------------------------------------------------------------------------
+
 class DualEncoder:
-    """Open-vocabulary context-aware word scorer using character n-gram embeddings.
+    """Open-vocabulary context-aware word scorer.
+
+    Context words are encoded by a GRU (with positional embeddings on the
+    inputs) rather than simple mean pooling.  Word embeddings use fastText-
+    style character n-gram mean pooling.
 
     Pure NumPy — no ML framework required at inference time.
-
-    Word embeddings are pre-computed at load time from the n-gram matrices,
-    making candidate scoring as fast as a plain DualEncoder (single matmul).
-
-    Open-vocabulary scoring (``score_word()``) is still available for words not
-    in the vocabulary, using the raw ngram embeddings directly.
     """
 
     def __init__(
@@ -106,21 +113,29 @@ class DualEncoder:
         ngram_to_id: dict[str, int],
         vocab: Vocabulary,
         ns: tuple[int, ...] = (2, 3),
+        gru_weights: "tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None" = None,
+        pos_embed: "np.ndarray | None" = None,
+        context_window: int = 3,
     ) -> None:
         """
         Args:
-            context_embeds: float32 (n_ngrams, embed_dim) — context role
-            word_embeds:    float32 (n_ngrams, embed_dim) — target role
+            context_embeds: float32 (n_ngrams, embed_dim)
+            word_embeds:    float32 (n_ngrams, embed_dim)
             ngram_to_id:    mapping from n-gram string to row index
-            vocab:          Vocabulary (used to build per-word pre-computed matrices)
-            ns:             n-gram sizes used during training (default: (2, 3))
+            vocab:          Vocabulary
+            ns:             n-gram sizes used during training
+            gru_weights:    (W_ih, W_hh, b_ih, b_hh) — PyTorch GRU convention.
+                            W_ih / W_hh : (3*dim, dim), b_ih / b_hh : (3*dim,).
+                            Gates stacked as [reset, update, new].
+                            None falls back to mean-pooling (no GRU).
+            pos_embed:      float32 (context_window, embed_dim) positional
+                            embeddings added to context words before the GRU.
+            context_window: number of preceding words in the context window.
         """
-        assert context_embeds.shape == word_embeds.shape, (
-            "context_embeds and word_embeds must have the same shape"
-        )
+        assert context_embeds.shape == word_embeds.shape
         self._ctx = context_embeds.astype(np.float32)
         self._wrd = word_embeds.astype(np.float32)
-        # Zero out the UNK row so unknown n-grams contribute nothing.
+        # Zero the UNK row so unknown n-grams contribute nothing.
         self._ctx[_UNK_NGRAM_ID] = 0.0
         self._wrd[_UNK_NGRAM_ID] = 0.0
         self._ngram_to_id = ngram_to_id
@@ -128,15 +143,26 @@ class DualEncoder:
         self._ns = ns
         self._dim = context_embeds.shape[1]
         self._n_ngrams = context_embeds.shape[0]
+        self._context_window = context_window
 
-        # Pre-compute dense (vocab_size, dim) matrices for fast lookup.
-        # Each row is the L2-normalised mean of a word's n-gram embeddings,
-        # matching the per-word normalisation applied during training.
+        # GRU weights (None → fall back to mean-pooling for backward compat)
+        if gru_weights is not None:
+            w_ih, w_hh, b_ih, b_hh = gru_weights
+            self._gru_W_ih = w_ih.astype(np.float32)
+            self._gru_W_hh = w_hh.astype(np.float32)
+            self._gru_b_ih = b_ih.astype(np.float32)
+            self._gru_b_hh = b_hh.astype(np.float32)
+        else:
+            self._gru_W_ih = self._gru_W_hh = self._gru_b_ih = self._gru_b_hh = None
+
+        # Positional embeddings: (context_window, dim)
+        self._pos_embed = pos_embed.astype(np.float32) if pos_embed is not None else None
+
+        # Pre-compute dense (vocab_size, dim) word matrices.
         self._ctx_matrix, self._word_matrix = self._precompute_word_matrices()
 
-        # 1-slot context cache — encode_context() is called on every keypress
-        # with the same context window; caching the result eliminates redundant
-        # computation within a typing burst.
+        # 1-slot context cache — eliminates redundant computation during a
+        # typing burst where the context is unchanged.
         self._ctx_cache_key: tuple[int, ...] | None = None
         self._ctx_cache_vec: np.ndarray | None = None
 
@@ -145,25 +171,8 @@ class DualEncoder:
     # ------------------------------------------------------------------
 
     def _precompute_word_matrices(self) -> tuple[np.ndarray, np.ndarray]:
-        """Build dense (vocab_size, dim) word matrices from n-gram embeddings.
-
-        For each word in the vocabulary:
-          1. Collect its n-gram IDs (falling back to UNK_NGRAM_ID=0 for OOV ngrams)
-          2. Mean-pool the corresponding rows from ctx_embeds / wrd_embeds
-          3. L2-normalise the resulting vector
-
-        The per-word L2 normalisation matches the training forward pass, where
-        each word embedding is normalised before being pooled into the context
-        vector — correcting the subtle discrepancy that existed in the old
-        inference path.
-
-        Returns:
-            ctx_matrix  : float32 (vocab_size, dim) — for encode_context
-            word_matrix : float32 (vocab_size, dim) — for score_candidates
-        """
+        """Build dense (vocab_size, dim) word matrices from n-gram embeddings."""
         vocab_size = self._vocab.size
-
-        # Build padded (vocab_size, max_ngrams) index table.
         rows: list[list[int]] = []
         for wid in range(vocab_size):
             word = self._vocab.id_to_word(wid)
@@ -171,7 +180,6 @@ class DualEncoder:
                 self._ngram_to_id.get(g, _UNK_NGRAM_ID)
                 for g in _char_ngrams(word, self._ns)
             ]
-            # Filter UNK so they don't dilute the mean (same as training).
             ids = [i for i in ids if i != _UNK_NGRAM_ID] or [_UNK_NGRAM_ID]
             rows.append(ids)
 
@@ -182,30 +190,20 @@ class DualEncoder:
             table[i, : len(row)] = row
             counts[i] = len(row)
 
-        # Vectorised mean-pool: (vocab_size, max_n, dim) → (vocab_size, dim)
         def _build_matrix(embed: np.ndarray) -> np.ndarray:
-            # embed: (n_ngrams, dim)
             vecs = embed[table]              # (vocab_size, max_n, dim)
             summed = vecs.sum(axis=1)        # (vocab_size, dim)
             means = summed / counts[:, None] # (vocab_size, dim)
-            # L2-normalise each row.
             norms = np.linalg.norm(means, axis=1, keepdims=True).clip(min=1e-8)
             return (means / norms).astype(np.float32)
 
-        ctx_matrix = _build_matrix(self._ctx)
-        word_matrix = _build_matrix(self._wrd)
-        return ctx_matrix, word_matrix
+        return _build_matrix(self._ctx), _build_matrix(self._wrd)
 
     # ------------------------------------------------------------------
-    # N-gram helpers (kept for score_word OOV path)
+    # N-gram helpers (OOV path)
     # ------------------------------------------------------------------
 
     def _ngram_ids(self, word: str) -> np.ndarray:
-        """Return an int32 array of n-gram IDs for ``word``.
-
-        OOV n-grams map to _UNK_NGRAM_ID (0), which is filtered out so it
-        doesn't dilute the mean.
-        """
         ids = [
             self._ngram_to_id.get(g, _UNK_NGRAM_ID)
             for g in _char_ngrams(word, self._ns)
@@ -214,21 +212,18 @@ class DualEncoder:
         return np.array(ids, dtype=np.int32)
 
     # ------------------------------------------------------------------
-    # Inference (same interface as old DualEncoder)
+    # Inference
     # ------------------------------------------------------------------
 
     def encode_context(self, context_ids: Sequence[int]) -> np.ndarray:
-        """Produce a context vector by mean-pooling pre-computed context embeddings.
+        """Produce a context vector from preceding word IDs.
 
-        Results are cached by context key — repeated calls with the same context
-        (common during a typing burst) return the cached vector immediately.
-
-        If context_ids is empty, returns the zero vector.
+        Results are cached by context key.  Returns the zero vector if
+        context_ids is empty.
         """
         key = tuple(context_ids)
         if key == self._ctx_cache_key and self._ctx_cache_vec is not None:
             return self._ctx_cache_vec
-
         vec = self._encode_context_impl(context_ids)
         self._ctx_cache_key = key
         self._ctx_cache_vec = vec
@@ -237,47 +232,89 @@ class DualEncoder:
     def _encode_context_impl(self, context_ids: Sequence[int]) -> np.ndarray:
         if not context_ids:
             return np.zeros(self._dim, dtype=np.float32)
-        vecs = self._ctx_matrix[np.asarray(context_ids, dtype=np.intp)]  # (n, dim)
-        ctx_vec = vecs.mean(axis=0)                                 # (dim,)
+        if self._gru_W_ih is not None:
+            return self._encode_context_gru(context_ids)
+        # Fallback: mean pooling (no GRU weights loaded)
+        vecs = self._ctx_matrix[np.asarray(context_ids, dtype=np.intp)]
+        ctx_vec = vecs.mean(axis=0)
         norm = np.linalg.norm(ctx_vec)
-        if norm > 0:
-            ctx_vec = ctx_vec / norm
-        return ctx_vec.astype(np.float32)
+        return (ctx_vec / norm if norm > 1e-8 else ctx_vec).astype(np.float32)
+
+    def _encode_context_gru(self, context_ids: Sequence[int]) -> np.ndarray:
+        """Encode context via GRU with positional embeddings.
+
+        Replicates the PyTorch training forward pass exactly:
+          1. Build left-padded context window (zeros for missing positions).
+          2. Look up L2-normalised word vectors from the pre-computed matrix.
+          3. Add positional embeddings.
+          4. Zero out padding positions (word_id == 0).
+          5. GRU forward pass (left → right).
+          6. L2-normalise the final hidden state.
+        """
+        window = self._context_window
+        dim = self._dim
+
+        # Build left-padded window: pad on left, real words on right.
+        padded_ids = np.zeros(window, dtype=np.intp)
+        n = min(len(context_ids), window)
+        padded_ids[window - n :] = np.asarray(context_ids, dtype=np.intp)[-n:]
+
+        # Word vectors (L2-normalised per word from pre-computed matrix).
+        word_vecs = self._ctx_matrix[padded_ids].copy()     # (window, dim)
+
+        # Positional embeddings — add before masking so padding adds 0.
+        if self._pos_embed is not None:
+            word_vecs += self._pos_embed                    # (window, dim)
+
+        # Mask out padding positions.
+        mask = (padded_ids != 0).astype(np.float32)[:, None]  # (window, 1)
+        word_vecs *= mask
+
+        # GRU forward (PyTorch gate order: reset, update, new).
+        H = dim
+        W_ih = self._gru_W_ih   # (3H, H)
+        W_hh = self._gru_W_hh   # (3H, H)
+        b_ih = self._gru_b_ih   # (3H,)
+        b_hh = self._gru_b_hh   # (3H,)
+        h = np.zeros(H, dtype=np.float32)
+
+        for x in word_vecs:
+            ih = W_ih @ x + b_ih    # (3H,)
+            hh = W_hh @ h + b_hh    # (3H,)
+            r = _sigmoid(ih[:H] + hh[:H])
+            z = _sigmoid(ih[H:2*H] + hh[H:2*H])
+            n_gate = np.tanh(ih[2*H:] + r * hh[2*H:])
+            h = (1.0 - z) * n_gate + z * h
+
+        norm = np.linalg.norm(h)
+        return (h / norm if norm > 1e-8 else h).astype(np.float32)
 
     def score_candidates(
         self,
         context_ids: Sequence[int],
         candidate_ids: Sequence[int],
     ) -> np.ndarray:
-        """Score each candidate word given the context.
-
-        Returns a float32 array of shape (len(candidate_ids),).
-        Higher = more likely given context.
-        """
+        """Score candidate words given context. Returns float32 (n_cands,)."""
         if not candidate_ids:
             return np.array([], dtype=np.float32)
         ctx_vec = self.encode_context(context_ids)
-        cand_vecs = self._word_matrix[list(candidate_ids)]   # (n_cands, dim)
-        return cand_vecs @ ctx_vec                    # (n_cands,)
+        cand_vecs = self._word_matrix[list(candidate_ids)]  # (n_cands, dim)
+        return cand_vecs @ ctx_vec                          # (n_cands,)
 
     def score_word(self, context_ids: Sequence[int], word: str) -> float:
-        """Score an arbitrary word (possibly OOV) given the context.
-
-        Uses the raw n-gram embeddings directly, without pre-computation.
-        Slower than score_candidates() but works for any word.
-        """
+        """Score an arbitrary (possibly OOV) word given context."""
         if not word:
             return 0.0
         ctx_vec = self.encode_context(context_ids)
         ids = self._ngram_ids(word)
         if len(ids) == 0 or np.all(ids == _UNK_NGRAM_ID):
             return 0.0
-        vecs = self._wrd[ids]  # (n_ngrams, dim)
-        word_vec = vecs.mean(axis=0)  # (dim,)
+        vecs = self._wrd[ids]
+        word_vec = vecs.mean(axis=0)
         norm = np.linalg.norm(word_vec)
-        if norm > 0:
+        if norm > 1e-8:
             word_vec = word_vec / norm
-        return word_vec @ ctx_vec
+        return float(word_vec @ ctx_vec)
 
     @property
     def embed_dim(self) -> int:
@@ -291,27 +328,39 @@ class DualEncoder:
     def vocab(self) -> Vocabulary:
         return self._vocab
 
+    @property
+    def context_window(self) -> int:
+        return self._context_window
+
     # ------------------------------------------------------------------
     # Quantization
     # ------------------------------------------------------------------
 
     def quantize_int8(self) -> "DualEncoder":
-        """Return a new DualEncoder with int8-quantized embeddings (~4× smaller).
+        """Return a new DualEncoder with int8-quantized n-gram embeddings (~4× smaller).
 
-        Scores remain comparable (scaling is absorbed into dot product norms).
+        GRU weights and positional embeddings are kept in float32.
         """
         def _quant(arr: np.ndarray) -> np.ndarray:
             scale = np.abs(arr).max(axis=1, keepdims=True).clip(min=1e-8)
             q = np.round(arr / scale * 127).clip(-127, 127).astype(np.int8)
-            # Dequantize back so the interface stays the same (float32 output)
             return (q.astype(np.float32) / 127.0) * scale
 
+        gru_weights = None
+        if self._gru_W_ih is not None:
+            gru_weights = (
+                self._gru_W_ih, self._gru_W_hh,
+                self._gru_b_ih, self._gru_b_hh,
+            )
         return DualEncoder(
             _quant(self._ctx),
             _quant(self._wrd),
             self._ngram_to_id,
             self._vocab,
             self._ns,
+            gru_weights=gru_weights,
+            pos_embed=self._pos_embed,
+            context_window=self._context_window,
         )
 
     # ------------------------------------------------------------------
@@ -319,30 +368,28 @@ class DualEncoder:
     # ------------------------------------------------------------------
 
     def save(self, path: str | Path) -> None:
-        """Save to a .npz file.
+        """Save to a .npz file."""
+        keys = np.array(list(self._ngram_to_id.keys()), dtype=object).astype("U")
+        ids = np.array(list(self._ngram_to_id.values()), dtype=np.int32)
 
-        Stored arrays:
-            context_embeds  : float32 (n_ngrams, dim)
-            word_embeds     : float32 (n_ngrams, dim)
-            ngram_keys      : byte string array of n-gram strings
-            ngram_ids       : int32 array of corresponding IDs
-            ns              : int32 array of n-gram sizes used (e.g. [2, 3])
-        """
-        keys = np.array(
-            list(self._ngram_to_id.keys()), dtype=object
-        ).astype("U")                               # unicode string array
-        ids = np.array(
-            list(self._ngram_to_id.values()), dtype=np.int32
-        )
-        buf = io.BytesIO()
-        np.savez_compressed(
-            buf,
+        save_kwargs: dict = dict(
             context_embeds=self._ctx,
             word_embeds=self._wrd,
             ngram_keys=keys,
             ngram_ids=ids,
             ns=np.array(list(self._ns), dtype=np.int32),
+            context_window=np.array(self._context_window, dtype=np.int32),
         )
+        if self._gru_W_ih is not None:
+            save_kwargs["gru_W_ih"] = self._gru_W_ih
+            save_kwargs["gru_W_hh"] = self._gru_W_hh
+            save_kwargs["gru_b_ih"] = self._gru_b_ih
+            save_kwargs["gru_b_hh"] = self._gru_b_hh
+        if self._pos_embed is not None:
+            save_kwargs["pos_embed"] = self._pos_embed
+
+        buf = io.BytesIO()
+        np.savez_compressed(buf, **save_kwargs)
         buf.seek(0)
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -358,12 +405,27 @@ class DualEncoder:
             for k, v in zip(arrays["ngram_keys"], arrays["ngram_ids"])
         }
         ns = tuple(int(n) for n in arrays["ns"])
+        context_window = int(arrays["context_window"]) if "context_window" in arrays else 3
+
+        gru_weights = None
+        if "gru_W_ih" in arrays:
+            gru_weights = (
+                arrays["gru_W_ih"].copy(),
+                arrays["gru_W_hh"].copy(),
+                arrays["gru_b_ih"].copy(),
+                arrays["gru_b_hh"].copy(),
+            )
+        pos_embed = arrays["pos_embed"].copy() if "pos_embed" in arrays else None
+
         return cls(
             context_embeds=arrays["context_embeds"].copy(),
             word_embeds=arrays["word_embeds"].copy(),
             ngram_to_id=ngram_to_id,
             vocab=vocab,
             ns=ns,
+            gru_weights=gru_weights,
+            pos_embed=pos_embed,
+            context_window=context_window,
         )
 
     # ------------------------------------------------------------------
@@ -377,6 +439,7 @@ class DualEncoder:
         embed_dim: int = 64,
         ns: tuple[int, ...] = (2, 3),
         seed: int = 0,
+        context_window: int = 3,
     ) -> "DualEncoder":
         """Random initialisation from a vocabulary (useful for tests)."""
         words = [vocab.id_to_word(i) for i in range(vocab.size)]
@@ -386,4 +449,15 @@ class DualEncoder:
         scale = 1.0 / math.sqrt(embed_dim)
         ctx = rng.normal(0, scale, (n, embed_dim)).astype(np.float32)
         wrd = rng.normal(0, scale, (n, embed_dim)).astype(np.float32)
-        return cls(ctx, wrd, ngram_to_id, vocab, ns=ns)
+        gru_scale = 1.0 / math.sqrt(embed_dim)
+        gru_W_ih = rng.normal(0, gru_scale, (3 * embed_dim, embed_dim)).astype(np.float32)
+        gru_W_hh = rng.normal(0, gru_scale, (3 * embed_dim, embed_dim)).astype(np.float32)
+        gru_b_ih = np.zeros(3 * embed_dim, dtype=np.float32)
+        gru_b_hh = np.zeros(3 * embed_dim, dtype=np.float32)
+        pos_embed = rng.normal(0, scale, (context_window, embed_dim)).astype(np.float32)
+        return cls(
+            ctx, wrd, ngram_to_id, vocab, ns=ns,
+            gru_weights=(gru_W_ih, gru_W_hh, gru_b_ih, gru_b_hh),
+            pos_embed=pos_embed,
+            context_window=context_window,
+        )

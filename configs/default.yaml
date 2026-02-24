@@ -19,8 +19,9 @@ datasets:
 # ---------------------------------------------------------------------------
 # Dictionary — optional verified wordlist to filter T9 candidates.
 # Set to null (or remove) to use all vocabulary words.
+# Download words_alpha.txt from: https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt
 # ---------------------------------------------------------------------------
-dictionary: "tt9-dictionary/en-utf8.txt"
+dictionary: "data/words_alpha.txt"
 
 # ---------------------------------------------------------------------------
 # Vocabulary
@@ -33,7 +34,7 @@ vocab:
 # Model architecture
 # ---------------------------------------------------------------------------
 model:
-  embed_dim: 64
+  embed_dim: 128
   context_window: 3
 
 # ---------------------------------------------------------------------------
@@ -47,6 +48,7 @@ training:
   min_lr_frac: 0.01
   objective: "sgns"              # "sgns" (default, O(B×k)) or "clip" (O(B²))
   n_negatives: 15                # negatives per positive (SGNS only)
+  hard_neg_frac: 0.5             # fraction of SGNS negatives that are T9-hard
   # temperature: 0.07            # softmax temperature (CLIP only)
   batch_size: 0                 # 0 = auto (picks based on GPU VRAM)
   accumulate_grad_batches: 1
@@ -62,11 +64,6 @@ pairs:
   shard_size: 10_000_000        # null for single file (small corpora)
 
 # ---------------------------------------------------------------------------
-# Bigram model
-# ---------------------------------------------------------------------------
-ngram: true
-
-# ---------------------------------------------------------------------------
 # Output directory — all artifacts are written here
 # ---------------------------------------------------------------------------
 output_dir: "data"
@@ -79,4 +76,3 @@ steps:
   - vocab
   - pairs
   - train
-  - ngram

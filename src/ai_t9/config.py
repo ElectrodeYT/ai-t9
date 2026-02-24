@@ -38,7 +38,6 @@ Example YAML::
       - vocab
       - pairs
       - train
-      - ngram
 """
 
 from __future__ import annotations
@@ -153,6 +152,7 @@ class TrainingConfig:
     checkpoint: str | None = None
     objective: str = "sgns"
     n_negatives: int = 15
+    hard_neg_frac: float = 0.5  # fraction of SGNS negatives that are T9-hard
 
     @staticmethod
     def from_dict(d: dict | None) -> TrainingConfig:
@@ -161,7 +161,7 @@ class TrainingConfig:
         return TrainingConfig(
             epochs=d.get("epochs", 5),
             lr=d.get("lr", 0.001),
-            weight_decay=float(d.get("weight_decay", 1e-4)), # In YAML, 1e-4 may be parsed as a string, so ensure it's a float
+            weight_decay=float(d.get("weight_decay", 1e-4)),
             warmup_frac=d.get("warmup_frac", 0.05),
             min_lr_frac=d.get("min_lr_frac", 0.01),
             temperature=d.get("temperature", 0.07),
@@ -173,6 +173,7 @@ class TrainingConfig:
             checkpoint=d.get("checkpoint"),
             objective=d.get("objective", "sgns"),
             n_negatives=d.get("n_negatives", 15),
+            hard_neg_frac=d.get("hard_neg_frac", 0.5),
         )
 
 
@@ -197,9 +198,9 @@ class S3Paths:
     dict: str = "vocab/dict.json"
     pairs: str = "pairs/"
     model: str = "models/model.npz"
-    ngram: str = "ngrams/bigram.npz"
     corpus: str = "corpuses/"
     checkpoint: str = "checkpoints/"
+    dictionary: str = "dictionaries/words_alpha.txt"
 
     @staticmethod
     def from_dict(d: dict | None) -> S3Paths:
@@ -210,9 +211,9 @@ class S3Paths:
             dict=d.get("dict", "vocab/dict.json"),
             pairs=d.get("pairs", "pairs/"),
             model=d.get("model", "models/model.npz"),
-            ngram=d.get("ngram", "ngrams/bigram.npz"),
             corpus=d.get("corpus", "corpuses/"),
             checkpoint=d.get("checkpoint", "checkpoints/"),
+            dictionary=d.get("dictionary", "dictionaries/words_alpha.txt"),
         )
 
 
@@ -256,7 +257,7 @@ class S3Config:
 
 
 # Default pipeline step order.
-DEFAULT_STEPS = ["corpus", "vocab", "pairs", "train", "ngram"]
+DEFAULT_STEPS = ["corpus", "vocab", "pairs", "train"]
 VALID_STEPS = set(DEFAULT_STEPS)
 
 
@@ -271,7 +272,6 @@ class RunConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     pairs: PairsConfig = field(default_factory=PairsConfig)
-    ngram: bool = True
     output_dir: str = "data"
     steps: list[str] = field(default_factory=lambda: list(DEFAULT_STEPS))
     s3: S3Config = field(default_factory=S3Config)
@@ -306,7 +306,6 @@ class RunConfig:
             model=ModelConfig.from_dict(d.get("model")),
             training=TrainingConfig.from_dict(d.get("training")),
             pairs=PairsConfig.from_dict(d.get("pairs")),
-            ngram=d.get("ngram", True),
             output_dir=d.get("output_dir", "data"),
             steps=d.get("steps", list(DEFAULT_STEPS)),
             s3=S3Config.from_dict(d.get("s3")),

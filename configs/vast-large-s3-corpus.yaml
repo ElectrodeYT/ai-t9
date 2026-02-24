@@ -46,9 +46,10 @@ datasets:
     key: "corpuses/wikitext.txt"
 
 # ---------------------------------------------------------------------------
-# Dictionary
+# Dictionary — auto-downloaded from S3 if not present locally
+# Upload words_alpha.txt to S3 at key: dictionaries/words_alpha.txt
 # ---------------------------------------------------------------------------
-# dictionary: "tt9-dictionary/en-utf8.txt"
+dictionary: "data/words_alpha.txt"
 
 # ---------------------------------------------------------------------------
 # Vocabulary
@@ -75,6 +76,7 @@ training:
   min_lr_frac: 0.01
   objective: "sgns"
   n_negatives: 15
+  hard_neg_frac: 0.5
   batch_size: 0                 # auto-detect (larger batches with SGNS)
   accumulate_grad_batches: 4    # effective batch = batch_size × 4
   clip_grad_norm: 1.0
@@ -89,11 +91,6 @@ pairs:
   shard_size: 10_000_000
 
 # ---------------------------------------------------------------------------
-# Bigram model
-# ---------------------------------------------------------------------------
-ngram: true
-
-# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 output_dir: "data"
@@ -106,7 +103,6 @@ steps:
   - vocab
   - pairs
   - train
-  - ngram
 
 # ---------------------------------------------------------------------------
 # S3 storage (Cloudflare R2 / AWS S3)
@@ -120,9 +116,9 @@ s3:
   region:     "auto"
   upload: true                  # push artifacts to S3 after each step
   paths:
-    vocab:  "vocab/vocab.json"
-    dict:   "vocab/dict.json"
-    pairs:  "pairs/"
-    model:  "models/model.npz"
-    ngram:  "ngrams/bigram.npz"
-    corpus: "corpuses/"
+    vocab:        "vocab/vocab.json"
+    dict:         "vocab/dict.json"
+    pairs:        "pairs/"
+    model:        "models/model.npz"
+    dictionary:   "dictionaries/words_alpha.txt"
+    corpus:       "corpuses/"

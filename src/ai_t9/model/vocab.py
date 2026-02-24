@@ -128,8 +128,8 @@ class Vocabulary:
         count of 1, giving them the lowest log-frequency above the UNK floor.
 
         This is intended for incorporating a verified dictionary: all wordlist
-        words will have real vocab IDs (not UNK), so the model and n-gram
-        scorer can assign them meaningful embeddings and bigram probabilities.
+        words will have real vocab IDs (not UNK), so the model can assign them
+        meaningful embeddings.
         """
         new_words = list(self._words)
         new_counts = list(self._counts)

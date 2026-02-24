@@ -8,7 +8,6 @@ Quick start::
     predictor = T9Predictor.from_files(
         "data/vocab.json", "data/dict.json",
         model_path="data/model.npz",
-        ngram_path="data/bigram.npz",
     )
 
     # One-shot prediction
@@ -23,14 +22,13 @@ Quick start::
 
 Training a custom model::
 
-    # Run the full pipeline (corpus → vocab → pairs → train → ngram):
+    # Run the full pipeline (corpus → vocab → pairs → train):
     #   ai-t9-run configs/default.yaml
     #
     # Then load the results:
     predictor = T9Predictor.from_files(
         "data/vocab.json", "data/dict.json",
         model_path="data/model.npz",
-        ngram_path="data/bigram.npz",
     )
 """
 

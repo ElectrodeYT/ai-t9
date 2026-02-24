@@ -21,7 +21,6 @@ Pipeline steps (in order):
     vocab    Build vocabulary and T9 dictionary from the corpus.
     pairs    Precompute (context, target) training pairs.
     train    Train the dual-encoder model from pairs.
-    ngram    Train a bigram language model from the corpus.
 
 S3 integration:
 
@@ -390,10 +389,16 @@ def step_vocab(cfg, workdir: Path, corpus_path: Path) -> None:
     vocab.save(vocab_path)
     _log(f"  Vocabulary: {vocab.size} words → {vocab_path}")
 
-    # Optional verified wordlist
+    # Optional verified wordlist — auto-download from S3 if not local.
     wordlist: set[str] | None = None
     if cfg.dictionary:
         dict_file = Path(cfg.dictionary)
+        if not dict_file.exists() and cfg.s3.enabled:
+            _log(f"  Dictionary not found locally — downloading from S3…")
+            try:
+                _s3_download(cfg.s3, cfg.s3.paths.dictionary, dict_file)
+            except Exception as exc:
+                _log(f"  WARNING: S3 dictionary download failed: {exc}")
         if dict_file.exists():
             wordlist = load_wordlist(dict_file)
             _log(f"  Wordlist: {len(wordlist):,} words from {dict_file}")
@@ -503,6 +508,7 @@ def step_train(cfg, workdir: Path) -> None:
         device=t.device,
         objective=t.objective,
         n_negatives=t.n_negatives,
+        hard_neg_frac=t.hard_neg_frac,
         temperature=t.temperature,
     )
 
@@ -586,44 +592,6 @@ def step_train(cfg, workdir: Path) -> None:
         _s3_upload(cfg.s3, model_path, cfg.s3.paths.model)
 
 
-def step_ngram(cfg, workdir: Path, corpus_path: Path) -> None:
-    """Train a bigram language model from the corpus."""
-    _log("=== Step: ngram ===")
-
-    if not cfg.ngram:
-        _log("  Skipped (ngram: false in config)")
-        return
-
-    from ai_t9.model.trainer import _corpus_file_sentence_ids
-    from ai_t9.model.vocab import Vocabulary
-    from ai_t9.ngram import BigramScorer
-
-    # Ensure vocab
-    vocab_path = workdir / "vocab.json"
-    if not _ensure_file(vocab_path, cfg.s3, cfg.s3.paths.vocab, "vocab.json"):
-        _log("ERROR: vocab.json not found. Run the 'vocab' step first.")
-        sys.exit(1)
-
-    if not corpus_path.exists():
-        _log(f"ERROR: corpus not found at {corpus_path}. Run the 'corpus' step first.")
-        sys.exit(1)
-
-    vocab = Vocabulary.load(vocab_path)
-    scorer = BigramScorer(vocab)
-
-    sents = _corpus_file_sentence_ids(corpus_path, vocab)
-    _log(f"  Training on {len(sents):,} sentences")
-    for sent in sents:
-        scorer.train_on_ids(sent)
-
-    ngram_path = workdir / "bigram.npz"
-    actual_path = scorer.save(ngram_path)
-    _log(f"  Bigram model → {actual_path}")
-
-    if cfg.s3.upload and cfg.s3.enabled:
-        _s3_upload(cfg.s3, Path(actual_path), cfg.s3.paths.ngram)
-
-
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -639,12 +607,11 @@ def main(argv: list[str] | None = None) -> int:
             "  vocab    Build vocabulary and T9 dictionary\n"
             "  pairs    Precompute training pairs\n"
             "  train    Train the dual-encoder model\n"
-            "  ngram    Train bigram language model\n"
             "\n"
             "Examples:\n"
             "  ai-t9-run configs/default.yaml\n"
             "  ai-t9-run configs/default.yaml --skip corpus\n"
-            "  ai-t9-run configs/default.yaml --step train --step ngram\n"
+            "  ai-t9-run configs/default.yaml --step train\n"
         ),
     )
     parser.add_argument("config", help="Path to YAML config file")
@@ -702,9 +669,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if "train" in steps:
         step_train(cfg, workdir)
-
-    if "ngram" in steps:
-        step_ngram(cfg, workdir, corpus_path)
 
     elapsed = time.monotonic() - t_start
     m, s = divmod(int(elapsed), 60)

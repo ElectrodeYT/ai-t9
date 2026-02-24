@@ -21,7 +21,6 @@ from ai_t9.t9_map import (
 from ai_t9.model.vocab import Vocabulary
 from ai_t9.dictionary import T9Dictionary
 from ai_t9.model.dual_encoder import DualEncoder
-from ai_t9.ngram import BigramScorer
 from ai_t9.predictor import T9Predictor, RankedCandidate, _normalise
 from ai_t9.session import T9Session
 
@@ -82,8 +81,8 @@ def tiny_dict(tiny_vocab: Vocabulary) -> T9Dictionary:
 
 @pytest.fixture
 def tiny_predictor(tiny_vocab: Vocabulary, tiny_dict: T9Dictionary) -> T9Predictor:
-    """Predictor with no model or ngram — pure frequency ranking."""
-    return T9Predictor(tiny_dict, model=None, ngram=None)
+    """Predictor with no model — pure frequency ranking."""
+    return T9Predictor(tiny_dict, model=None)
 
 
 @pytest.fixture
@@ -368,51 +367,6 @@ class TestDualEncoder:
         cand_ids = [1, 2, 3]
         scores = q.score_candidates(ctx_ids, cand_ids)
         assert scores.shape == (3,)
-
-
-# ===========================================================================
-# BigramScorer tests
-# ===========================================================================
-
-class TestBigramScorer:
-    @pytest.fixture
-    def trained_bigram(self, tiny_vocab: Vocabulary) -> BigramScorer:
-        scorer = BigramScorer(tiny_vocab)
-        # Simulate a corpus: "the good home"
-        ids = tiny_vocab.words_to_ids(["the", "good", "home", "the", "good", "gone"])
-        scorer.train_on_ids(ids)
-        return scorer
-
-    def test_log_prob_negative(self, trained_bigram: BigramScorer, tiny_vocab: Vocabulary):
-        the_id = tiny_vocab.word_to_id("the")
-        good_id = tiny_vocab.word_to_id("good")
-        lp = trained_bigram.log_prob(the_id, good_id)
-        assert lp < 0
-
-    def test_seen_bigram_higher_than_unseen(self, trained_bigram: BigramScorer, tiny_vocab: Vocabulary):
-        the_id = tiny_vocab.word_to_id("the")
-        good_id = tiny_vocab.word_to_id("good")
-        hood_id = tiny_vocab.word_to_id("hood")
-        lp_seen = trained_bigram.log_prob(the_id, good_id)
-        lp_unseen = trained_bigram.log_prob(the_id, hood_id)
-        assert lp_seen > lp_unseen
-
-    def test_score_candidates_length(self, trained_bigram: BigramScorer, tiny_vocab: Vocabulary):
-        the_id = tiny_vocab.word_to_id("the")
-        cand_ids = tiny_vocab.words_to_ids(["home", "gone", "good", "hood"])
-        scores = trained_bigram.score_candidates(the_id, cand_ids)
-        assert len(scores) == 4
-
-    def test_save_load_roundtrip(self, trained_bigram: BigramScorer, tiny_vocab: Vocabulary, tmp_path):
-        path = tmp_path / "bigram.json"
-        trained_bigram.save(path)
-        loaded = BigramScorer.load(path, tiny_vocab)
-        the_id = tiny_vocab.word_to_id("the")
-        good_id = tiny_vocab.word_to_id("good")
-        assert math.isclose(
-            trained_bigram.log_prob(the_id, good_id),
-            loaded.log_prob(the_id, good_id),
-        )
 
 
 # ===========================================================================

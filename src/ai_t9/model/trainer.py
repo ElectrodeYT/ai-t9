@@ -656,9 +656,18 @@ class _BaseTrainer:
             print(f"  [{time.strftime('%H:%M:%S')}] Model ready in {time.monotonic() - t_build:.1f}s", flush=True)
 
         # embed_fn for objectives that need to embed extra word IDs (e.g. SGNS
-        # negative sampling).  Uses the *uncompiled* model so the call works
-        # regardless of torch.compile graph boundaries.
-        embed_fn = getattr(model, 'embed_tgt_words', None)
+        # negative sampling).  Compiled separately from the forward pass so the
+        # hot negative-embedding path benefits from kernel fusion.
+        _raw_embed_fn = getattr(model, 'embed_tgt_words', None)
+        if _raw_embed_fn is not None and hasattr(torch, "compile"):
+            try:
+                embed_fn = torch.compile(
+                    _raw_embed_fn, mode="max-autotune-no-cudagraphs"
+                )
+            except Exception:
+                embed_fn = _raw_embed_fn
+        else:
+            embed_fn = _raw_embed_fn
 
         # Restore model from checkpoint
         if self._checkpoint_data is not None and self._checkpoint_data.get('model_state_dict'):
@@ -840,7 +849,16 @@ class _BaseTrainer:
         model, compiled = self._build_model(torch, device)
         self._model = model
         model.train()
-        embed_fn = getattr(model, 'embed_tgt_words', None)
+        _raw_embed_fn = getattr(model, 'embed_tgt_words', None)
+        if _raw_embed_fn is not None and hasattr(torch, "compile"):
+            try:
+                embed_fn = torch.compile(
+                    _raw_embed_fn, mode="max-autotune-no-cudagraphs"
+                )
+            except Exception:
+                embed_fn = _raw_embed_fn
+        else:
+            embed_fn = _raw_embed_fn
         if verbose:
             print(f"  [{time.strftime('%H:%M:%S')}] Model ready in {time.monotonic() - t_build:.1f}s", flush=True)
 
@@ -1064,7 +1082,7 @@ class _BaseTrainer:
                 if self._clip_grad_norm > 0:
                     if scaler is not None:
                         scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(compiled.parameters(), self._clip_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(self._model.parameters(), self._clip_grad_norm)
                 if scaler is not None:
                     scaler.step(optimizer)
                     scaler.update()
@@ -1325,21 +1343,25 @@ class DualEncoderTrainer(_BaseTrainer):
             def _embed_words(self_, embed_layer, word_ids):
                 """Mean-pool n-gram embeddings, then L2-normalise per word.
 
-                Uses F.embedding_bag to compute the bag sum without
-                materialising the large (n, max_ngrams, dim) intermediate
-                tensor.  This is the dominant memory bottleneck for large
-                negative counts, so eliminating it gives a significant
-                throughput increase.
+                Deduplicates word_ids before the embedding_bag call so that
+                each unique word is embedded exactly once, then gathers
+                results back to the original shape.  With large batches where
+                B*k >> vocab_size (e.g. 490k neg IDs over a 50k vocab) the
+                same word would otherwise be embedded ~10x redundantly —
+                deduplication is the dominant speed win on the negative
+                sampling path.
                 """
                 F = torch.nn.functional
-                ng_ids = self_._ng_table[word_ids]            # (n, max_ngrams)
-                # Fused sum: avoids creating (n, max_ngrams, dim) tensor.
+                unique_ids, inverse = torch.unique(word_ids, return_inverse=True)
+                ng_ids = self_._ng_table[unique_ids]          # (n_unique, max_ngrams)
+                # Fused sum: avoids creating (n_unique, max_ngrams, dim) tensor.
                 summed = F.embedding_bag(
                     ng_ids, embed_layer.weight,
                     mode="sum", padding_idx=0,
-                )                                             # (n, dim)
-                counts = self_._ng_counts[word_ids]           # (n, 1)
-                return F.normalize(summed / counts, dim=-1)   # (n, dim)
+                )                                             # (n_unique, dim)
+                counts = self_._ng_counts[unique_ids]         # (n_unique, 1)
+                unique_vecs = F.normalize(summed / counts, dim=-1)
+                return unique_vecs[inverse]                   # (n, dim)
 
             def embed_tgt_words(self_, word_ids):
                 """Embed word IDs through the target (word) embedding table."""

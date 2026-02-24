@@ -60,17 +60,21 @@ def create_instance(
     offer_id: int,
     image: str,
     disk_gb: int = 30,
-    interruptable: bool = False,
+    bid_price: float | None = None,
 ) -> int:
-    """Create an instance from an offer ID. Returns the new instance ID."""
+    """Create an instance from an offer ID. Returns the new instance ID.
+
+    When *bid_price* is set the instance is created as an interruptable
+    (spot-like) bid.  Omit it for an on-demand instance.
+    """
     args = [
         "create", "instance", str(offer_id),
         "--image", image,
         "--disk", str(disk_gb),
         "--raw",
     ]
-    if interruptable:
-        args.append("--interruptable")
+    if bid_price is not None:
+        args.extend(["--bid_price", str(bid_price)])
     result = _vastai(*args)
     if result.returncode != 0:
         raise RuntimeError(

@@ -199,6 +199,7 @@ class S3Paths:
     model: str = "models/model.npz"
     ngram: str = "ngrams/bigram.npz"
     corpus: str = "corpuses/"
+    checkpoint: str = "checkpoints/"
 
     @staticmethod
     def from_dict(d: dict | None) -> S3Paths:
@@ -211,6 +212,7 @@ class S3Paths:
             model=d.get("model", "models/model.npz"),
             ngram=d.get("ngram", "ngrams/bigram.npz"),
             corpus=d.get("corpus", "corpuses/"),
+            checkpoint=d.get("checkpoint", "checkpoints/"),
         )
 
 

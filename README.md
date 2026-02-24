@@ -42,7 +42,8 @@ pair precomputation, dual-encoder training, and bigram model training — writin
 all artifacts to `data/`.
 
 See **[USAGE.md](USAGE.md)** for the complete guide: per-step CLI flags, cloud
-training on Vast.ai and Modal, S3/R2 data management, and demo instructions.
+training on Vast.ai and Modal, the autonomous training manager for unattended
+spot-instance training, S3/R2 data management, and demo instructions.
 
 ## Using as a library
 

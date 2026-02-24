@@ -131,6 +131,87 @@ def _ensure_file(
     return False
 
 
+class _S3CheckpointManager:
+    """Atomic two-slot S3 checkpoint protocol.
+
+    Layout in the bucket::
+
+        {prefix}/ckpt_0.pt    — slot 0 checkpoint file
+        {prefix}/ckpt_1.pt    — slot 1 checkpoint file
+        {prefix}/ptr.json     — pointer: {"slot": 0|1, "epoch": N, "shard": N, "step": N}
+
+    Save sequence (guarantees the last *fully committed* checkpoint is always
+    recoverable, even if the instance is interrupted mid-save):
+
+        1. Upload new checkpoint to the *inactive* slot.
+        2. Write + upload ``ptr.json`` pointing to that slot  ← the "commit".
+
+    If the instance is interrupted between steps 1 and 2, the pointer still
+    points to the *previous* valid slot, so ``download_latest`` returns that.
+    If interrupted during step 1, the pointer still points to the safe slot.
+    """
+
+    def __init__(self, s3_cfg, remote_prefix: str) -> None:
+        self._s3_cfg = s3_cfg
+        self._prefix = remote_prefix.rstrip("/")
+        self._active_slot: int = 0  # slot currently referenced by ptr.json
+
+    def _ptr_key(self) -> str:
+        return f"{self._prefix}/ptr.json"
+
+    def _slot_key(self, slot: int) -> str:
+        return f"{self._prefix}/ckpt_{slot}.pt"
+
+    def download_latest(self, local_dir: Path) -> "Path | None":
+        """Download the latest committed checkpoint.
+
+        Returns the local path of the checkpoint file, or ``None`` if no
+        committed checkpoint exists in S3.
+        """
+        import json
+
+        local_dir.mkdir(parents=True, exist_ok=True)
+        ptr_local = local_dir / "ptr.json"
+
+        try:
+            _s3_download(self._s3_cfg, self._ptr_key(), ptr_local)
+        except Exception:
+            return None  # No checkpoint in S3 yet
+
+        try:
+            with open(ptr_local) as f:
+                ptr = json.load(f)
+            slot = int(ptr["slot"])
+        except Exception:
+            return None
+
+        ckpt_local = local_dir / f"ckpt_{slot}.pt"
+        try:
+            _s3_download(self._s3_cfg, self._slot_key(slot), ckpt_local)
+        except Exception:
+            return None
+
+        self._active_slot = slot
+        return ckpt_local
+
+    def upload(self, local_path: Path, epoch: int, shard: int, step: int) -> None:
+        """Upload *local_path* to the inactive slot then atomically commit."""
+        import json
+
+        inactive = 1 - self._active_slot
+
+        # Step 1: upload checkpoint to the inactive slot.
+        _s3_upload(self._s3_cfg, local_path, self._slot_key(inactive))
+
+        # Step 2: write + upload pointer (the "commit").
+        ptr = {"slot": inactive, "epoch": epoch, "shard": shard, "step": step}
+        ptr_local = local_path.parent / "ptr.json"
+        ptr_local.write_text(__import__("json").dumps(ptr))
+        _s3_upload(self._s3_cfg, ptr_local, self._ptr_key())
+
+        self._active_slot = inactive
+
+
 def _ensure_pairs_dir(
     local_dir: Path, s3_cfg, remote_prefix: str
 ) -> bool:
@@ -425,12 +506,53 @@ def step_train(cfg, workdir: Path) -> None:
         temperature=t.temperature,
     )
 
-    # Load checkpoint if available
-    if t.checkpoint and Path(t.checkpoint).exists():
-        _log(f"  Loading checkpoint: {t.checkpoint}")
-        trainer.load_checkpoint(t.checkpoint)
+    # ---- Checkpoint setup ------------------------------------------------
+    # Local checkpoint directory is always workdir/checkpoints/.
+    # When S3 is configured we use the two-slot atomic protocol to keep the
+    # last fully committed checkpoint safe even under mid-save interruptions.
+    ckpt_dir = workdir / "checkpoints"
+    ckpt_path = ckpt_dir / "checkpoint.pt"
+    ckpt_manager: _S3CheckpointManager | None = None
 
-    # Train from shards or single file
+    if cfg.s3.enabled:
+        remote_ckpt_prefix = cfg.s3.paths.checkpoint.rstrip("/")
+        ckpt_manager = _S3CheckpointManager(cfg.s3, remote_ckpt_prefix)
+        _log("  Checking S3 for existing checkpoint…")
+        downloaded = ckpt_manager.download_latest(ckpt_dir)
+        if downloaded:
+            _log(f"  Restored checkpoint from S3 → {downloaded}")
+            ckpt_path = downloaded
+        else:
+            _log("  No checkpoint found in S3 — starting fresh")
+
+    # Also honour the legacy config field (local path only).
+    if not ckpt_path.exists() and t.checkpoint and Path(t.checkpoint).exists():
+        ckpt_path = Path(t.checkpoint)
+
+    if ckpt_path.exists():
+        _log(f"  Loading checkpoint: {ckpt_path}")
+        trainer.load_checkpoint(ckpt_path)
+
+    # Callback: after every local save, upload to S3 via the two-slot manager.
+    def _on_checkpoint(path: Path) -> None:
+        if ckpt_manager is None:
+            return
+        try:
+            import torch as _torch
+            data = _torch.load(path, map_location="cpu", weights_only=False)
+            epoch = data.get("epoch", 0)
+            shard = data.get("shard", -1)
+            step = data.get("global_step", 0)
+        except Exception:
+            epoch = shard = step = 0
+        try:
+            ckpt_manager.upload(path, epoch=epoch, shard=shard, step=step)
+        except Exception as exc:
+            _log(f"  WARNING: S3 checkpoint upload failed: {exc}")
+
+    on_checkpoint = _on_checkpoint if ckpt_manager is not None else None
+
+    # ---- Train -----------------------------------------------------------
     shards = sorted(pairs_dir.glob("pairs_*.npz"))
     if shards:
         _log(f"  Training from {len(shards)} shard(s)")
@@ -438,7 +560,8 @@ def step_train(cfg, workdir: Path) -> None:
             pairs_dir,
             epochs=t.epochs,
             verbose=True,
-            checkpoint_path=t.checkpoint,
+            checkpoint_path=ckpt_path,
+            on_checkpoint=on_checkpoint,
         )
     else:
         pairs_file = pairs_dir / "pairs.npz"
@@ -448,7 +571,8 @@ def step_train(cfg, workdir: Path) -> None:
                 pairs_file,
                 epochs=t.epochs,
                 verbose=True,
-                checkpoint_path=t.checkpoint,
+                checkpoint_path=ckpt_path,
+                on_checkpoint=on_checkpoint,
             )
         else:
             _log("ERROR: No pairs files found in pairs directory")

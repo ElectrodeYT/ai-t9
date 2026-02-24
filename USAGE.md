@@ -11,7 +11,8 @@
   - [Precompute training pairs](#precompute-training-pairs)
 - [Data artifacts](#data-artifacts)
 - [Cloud training](#cloud-training)
-  - [Vast.ai](#vastai)
+  - [Vast.ai (blocking)](#vastai-blocking)
+  - [Vast.ai autonomous manager](#vastai-autonomous-manager)
   - [Modal](#modal)
 - [S3/R2 bucket management](#s3r2-bucket-management)
 - [Demos](#demos)
@@ -244,7 +245,7 @@ different builds.
 
 ## Cloud training
 
-### Vast.ai
+### Vast.ai (blocking)
 
 `scripts/vast_orchestrate.py` provisions a GPU instance, uploads the current
 local package as a wheel, runs `ai-t9-run`, downloads the artifacts, and tears
@@ -314,6 +315,7 @@ python scripts/vast_orchestrate.py configs/vast-large.yaml --no-destroy
 | `--instance-id N` | — | Reuse an existing instance |
 | `--no-destroy` | off | Keep the instance after training |
 | `--dry-run` | off | Print best offer and exit |
+| `--detach` | off | Upload artifacts to S3, start supervisor in tmux, exit immediately (see [Autonomous manager](#vastai-autonomous-manager)) |
 
 **S3 credentials** (`AI_T9_S3_ENDPOINT`, `AI_T9_S3_BUCKET`,
 `AI_T9_S3_ACCESS_KEY`, `AI_T9_S3_SECRET_KEY`) and HuggingFace tokens
@@ -334,6 +336,184 @@ docker push myuser/ai-t9-trainer:latest
 python scripts/vast_orchestrate.py configs/vast-large.yaml \
     --image myuser/ai-t9-trainer:latest --install skip
 ```
+
+### Vast.ai autonomous manager
+
+The **autonomous manager** (`scripts/vast_manager.py`) solves the single biggest
+problem with interruptable (spot) instances: if your laptop goes to sleep or
+loses internet while training, the blocking SSH session dies and training never
+resumes.
+
+The manager runs on a cheap always-on VPS. It polls S3 for heartbeats written by
+a lightweight supervisor process on the GPU instance. When the instance is
+preempted (or the heartbeat goes stale), the manager automatically provisions a
+new instance and picks up where training left off — no human intervention needed.
+
+```
+[Browser] ──HTTP:7860──► [VPS: vast_manager.py]
+                               │ polls S3 every 2 min
+                               ▼
+                          [S3: jobs/ prefix]  ◄── [GPU: supervisor.py writes heartbeat]
+                               │                        │
+                               └──── provision ────────►└── runs ai-t9-run
+```
+
+#### Architecture
+
+| Component | Where it runs | What it does |
+|-----------|---------------|--------------|
+| `vast_manager.py` | VPS (always-on) | Poll loop, HTTP API, web UI |
+| `vast_supervisor.py` | GPU instance (tmux) | Wraps `ai-t9-run`, heartbeats S3 every 60 s |
+| `jobs/` S3 prefix | S3 bucket | Single source of truth for all job state |
+
+The manager is **stateless** — all job state lives in S3. You can restart the
+manager at any time without affecting running jobs.
+
+#### VPS setup
+
+```bash
+# Install deps
+pip install boto3 paramiko vastai pyyaml
+
+# Set credentials (add to /etc/environment or a .env file)
+export AI_T9_S3_ENDPOINT="https://<account>.r2.cloudflarestorage.com"
+export AI_T9_S3_BUCKET="my-ai-t9-bucket"
+export AI_T9_S3_ACCESS_KEY="..."
+export AI_T9_S3_SECRET_KEY="..."
+export AI_T9_S3_REGION="auto"
+export AI_T9_JOBS_PREFIX="jobs/"          # optional, default: jobs/
+
+# Authenticate vastai CLI
+vastai apikey set <your-api-key>
+
+# Start the manager
+python scripts/vast_manager.py --port 7860
+```
+
+Open `http://<vps-ip>:7860` in your browser. The dashboard shows all jobs with
+live status and a log of events.
+
+**Tip:** expose behind nginx with HTTP Basic Auth if the port is publicly
+accessible.
+
+#### Systemd service (recommended)
+
+Generate a ready-to-use unit file:
+
+```bash
+python scripts/vast_manager.py --print-systemd-unit \
+    | sudo tee /etc/systemd/system/ai-t9-manager.service
+sudo systemctl enable --now ai-t9-manager
+sudo journalctl -u ai-t9-manager -f
+```
+
+The generated unit file uses `EnvironmentFile=` for credentials and
+`Restart=on-failure` so the manager comes back automatically after a VPS reboot
+or crash.
+
+#### Creating a job via the web UI
+
+1. Open `http://<vps-ip>:7860`
+2. Click **+ New Job**
+3. Paste your YAML config, set GPU/price/options, click **Create Job**
+
+The manager uploads the config (and wheel if install=wheel) to S3, provisions
+the instance, deploys the supervisor into a tmux session, and returns the job
+card. Creation takes ~2 minutes; the modal shows a spinner while it waits.
+
+#### Creating a job via the API
+
+```bash
+curl -s -X POST http://<vps-ip>:7860/api/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "config_yaml": "output_dir: data\n...",
+    "gpu": "RTX_3090",
+    "num_gpus": 1,
+    "max_price": 0.5,
+    "min_vram": 16,
+    "interruptable": true,
+    "install": "wheel",
+    "skip_steps": ["corpus", "vocab"]
+  }'
+```
+
+Response is a job JSON object with `job_id`, `status`, `instance_id`, and an
+`events` array.
+
+#### Using `--detach` from the orchestrator
+
+If you prefer to trigger jobs from the command line rather than the web UI:
+
+```bash
+# Upload artifacts to S3, provision instance, exit immediately.
+# The job is then managed by the autonomous manager running on your VPS.
+python scripts/vast_orchestrate.py configs/vast-large.yaml \
+    --interruptable --detach
+```
+
+This prints the `job_id` and exits. You can monitor the job in the manager UI
+or by checking S3 directly:
+
+```bash
+aws s3 cp s3://<bucket>/jobs/<job-id>/heartbeat.json - | python -m json.tool
+aws s3 cp s3://<bucket>/jobs/<job-id>/manifest.json  - | python -m json.tool
+```
+
+#### Stopping and restarting jobs
+
+Via the web UI, use the **Stop** and **Restart** buttons on each job card.
+
+Via the API:
+
+```bash
+# Stop a running job (destroys the instance)
+curl -s -X POST http://<vps-ip>:7860/api/jobs/<job-id>/stop
+
+# Manually restart a stopped/failed/completed job
+curl -s -X POST http://<vps-ip>:7860/api/jobs/<job-id>/restart
+```
+
+#### S3 layout
+
+```
+jobs/
+  train-20240215-a3f2b1/
+    manifest.json          job state (status, events, instance info)
+    heartbeat.json         written by supervisor every 60 s
+    supervisor.py          uploaded at job creation for re-deployment
+    train_config.yaml      YAML config used for this run
+    wheel/
+      ai_t9-*.whl          uploaded at job creation (if install==wheel)
+
+checkpoints/               written by ai-t9-run (unchanged)
+  ckpt_0.pt
+  ptr.json                 read by manager for epoch/shard progress display
+```
+
+#### How preemption recovery works
+
+1. Supervisor writes `heartbeat.json` every 60 s. If the instance is preempted,
+   writes stop.
+2. Manager's poll loop (every 2 min by default) reads the heartbeat. If it's
+   older than 5 min it calls `vastai show instance` to verify the instance is
+   still alive.
+3. If the instance is gone, the manager provisions a fresh one, re-uploads the
+   supervisor and config from S3, starts the supervisor in tmux, and increments
+   `restart_count` in the manifest.
+4. `ai-t9-run` picks up from the latest checkpoint in S3 automatically (as long
+   as your config has S3 upload enabled for checkpoints).
+
+#### Job status reference
+
+| Status | Meaning |
+|--------|---------|
+| `pending` | Job created, not yet provisioned (or between retries) |
+| `running` | Instance alive, supervisor heartbeating |
+| `completed` | `ai-t9-run` exited 0; supervisor wrote final status |
+| `failed` | `ai-t9-run` exited non-zero, or provisioning failed |
+| `stopped` | Manually stopped via UI / API |
+| `interrupted` | Preempted; manager is respawning |
 
 ### Modal
 

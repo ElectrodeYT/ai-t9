@@ -44,6 +44,10 @@ Usage:
 
     # Multi-GPU instance
     python scripts/vast_orchestrate.py configs/vast-large.yaml --num-gpus 2 --max-price 2.0
+
+    # Detach mode: provision instance, start supervisor in tmux, exit immediately
+    # (requires S3 env vars; job is then managed by vast_manager.py)
+    python scripts/vast_orchestrate.py configs/vast-large.yaml --detach
 """
 
 from __future__ import annotations
@@ -142,6 +146,153 @@ def _read_remote_output_dir(config_path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Detach mode
+# ---------------------------------------------------------------------------
+
+
+def _run_detach(args, config_path: Path, wheel_path: Path | None, forward_env: dict) -> int:
+    """Provision instance, upload artifacts to S3, start supervisor in tmux, exit.
+
+    Returns exit code (0 on success, 1 on failure).
+    """
+    # Validate S3 env vars
+    required_s3 = ["AI_T9_S3_BUCKET", "AI_T9_S3_ACCESS_KEY", "AI_T9_S3_SECRET_KEY"]
+    missing = [k for k in required_s3 if not os.environ.get(k)]
+    if missing:
+        print(f"ERROR: --detach requires env vars: {', '.join(missing)}", file=sys.stderr)
+        return 1
+
+    # Lazy import of S3/job modules so non-detach users don't need boto3
+    try:
+        import boto3  # type: ignore
+    except ImportError:
+        print("ERROR: --detach requires boto3. Install with: pip install boto3", file=sys.stderr)
+        return 1
+
+    from vast.jobs import make_job_id, save_job, Job
+    from vast.provision import ProvisionConfig, provision_and_start
+
+    bucket = os.environ["AI_T9_S3_BUCKET"]
+    prefix = os.environ.get("AI_T9_JOBS_PREFIX", "jobs/")
+
+    # Build S3 client
+    endpoint = os.environ.get("AI_T9_S3_ENDPOINT")
+    s3_kwargs: dict = {
+        "aws_access_key_id": os.environ.get("AI_T9_S3_ACCESS_KEY"),
+        "aws_secret_access_key": os.environ.get("AI_T9_S3_SECRET_KEY"),
+        "region_name": os.environ.get("AI_T9_S3_REGION", "us-east-1"),
+    }
+    if endpoint:
+        s3_kwargs["endpoint_url"] = endpoint
+    s3 = boto3.client("s3", **s3_kwargs)
+
+    job_id = make_job_id()
+    print(f"Detach mode: job_id={job_id}")
+
+    def _s3_key(filename: str) -> str:
+        return f"{prefix.rstrip('/')}/{job_id}/{filename}"
+
+    # Upload config YAML
+    config_key = _s3_key("train_config.yaml")
+    print(f"Uploading config → s3://{bucket}/{config_key}")
+    s3.put_object(
+        Bucket=bucket, Key=config_key,
+        Body=config_path.read_bytes(), ContentType="text/yaml",
+    )
+
+    # Upload wheel
+    wheel_key: str | None = None
+    if wheel_path is not None:
+        wheel_key = _s3_key(f"wheel/{wheel_path.name}")
+        print(f"Uploading wheel → s3://{bucket}/{wheel_key}")
+        s3.put_object(
+            Bucket=bucket, Key=wheel_key,
+            Body=wheel_path.read_bytes(), ContentType="application/octet-stream",
+        )
+
+    # Upload supervisor.py
+    supervisor_src = Path(__file__).parent / "vast_supervisor.py"
+    if not supervisor_src.exists():
+        print(f"ERROR: {supervisor_src} not found", file=sys.stderr)
+        return 1
+    supervisor_key = _s3_key("supervisor.py")
+    print(f"Uploading supervisor → s3://{bucket}/{supervisor_key}")
+    s3.put_object(
+        Bucket=bucket, Key=supervisor_key,
+        Body=supervisor_src.read_bytes(), ContentType="text/x-python",
+    )
+
+    # Create job manifest
+    job = Job(
+        job_id=job_id,
+        status="pending",
+        gpu=args.gpu,
+        num_gpus=args.num_gpus,
+        min_vram=args.min_vram,
+        max_price=args.max_price,
+        cuda_version=args.cuda_version,
+        disk_gb=args.disk,
+        interruptable=args.interruptable or args.bid_price is not None,
+        bid_price=args.bid_price,
+        image=args.image,
+        install=args.install,
+        config_s3_key=config_key,
+        wheel_s3_key=wheel_key,
+        supervisor_s3_key=supervisor_key,
+        run_steps=args.step or [],
+        skip_steps=args.skip or [],
+    )
+    job.add_event("created", "Job created via --detach mode")
+    save_job(s3, bucket, prefix, job)
+
+    # Provision and start
+    cfg = ProvisionConfig(
+        gpu=args.gpu,
+        num_gpus=args.num_gpus,
+        min_vram=args.min_vram,
+        max_price=args.max_price,
+        cuda_version=args.cuda_version,
+        disk_gb=args.disk,
+        interruptable=args.interruptable or args.bid_price is not None,
+        bid_price=args.bid_price,
+        image=args.image,
+        install=args.install,
+        config_s3_key=config_key,
+        wheel_s3_key=wheel_key,
+        supervisor_s3_key=supervisor_key,
+        run_steps=args.step or [],
+        skip_steps=args.skip or [],
+        forward_env=forward_env,
+        ssh_max_retries=args.ssh_retries,
+        stabilize_wait=args.stabilize_wait,
+    )
+
+    try:
+        instance_id, ssh_host, ssh_port = provision_and_start(
+            cfg, s3, bucket, prefix, job_id,
+            log=print,
+        )
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        job.status = "failed"
+        job.add_event("failed", str(exc))
+        save_job(s3, bucket, prefix, job)
+        return 1
+
+    job.instance_id = instance_id
+    job.ssh_host = ssh_host
+    job.ssh_port = ssh_port
+    job.status = "running"
+    job.add_event("running", f"Supervisor started on instance {instance_id} at {ssh_host}:{ssh_port}")
+    save_job(s3, bucket, prefix, job)
+
+    print(f"\nJob {job_id} started in detach mode.")
+    print(f"  Instance: {instance_id}  SSH: {ssh_host}:{ssh_port}")
+    print(f"  Monitor: vast_manager.py  or  aws s3 cp s3://{bucket}/{prefix}{job_id}/heartbeat.json -")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -205,8 +356,20 @@ def main(argv: list[str] | None = None) -> int:
         "--interruptable",
         action="store_true",
         help=(
-            "Rent as an interruptable (spot-like) instance — cheaper but may be "
-            "preempted. Use --retries to automatically respawn on interruption."
+            "Rent as an interruptable (spot-like) instance by bidding the offer's "
+            "min_bid price. Cheaper but may be preempted. "
+            "Use --retries to automatically respawn on interruption."
+        ),
+    )
+    parser.add_argument(
+        "--bid-price",
+        type=float,
+        default=None,
+        metavar="$/HR",
+        help=(
+            "Override the bid price for an interruptable instance (implies "
+            "--interruptable). Defaults to the offer's min_bid when --interruptable "
+            "is used without an explicit price."
         ),
     )
     parser.add_argument(
@@ -284,6 +447,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Local directory to download artifacts to (default: data/)",
     )
 
+    # Detach mode
+    parser.add_argument(
+        "--detach",
+        action="store_true",
+        help=(
+            "Provision the instance, upload the supervisor and config to S3, "
+            "start the supervisor in a tmux session, then exit immediately. "
+            "Training is managed autonomously by vast_manager.py. "
+            "Requires AI_T9_S3_* environment variables."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     config_path = Path(args.config)
@@ -334,6 +509,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Reliability:  {best.get('reliability', 0):.1%}")
         return 0
 
+    # ---- Detach mode -------------------------------------------------------
+    if args.detach:
+        return _run_detach(args, config_path, wheel_path, forward_env)
+
     # ---- Provision + train (with optional retries on interruption) ---------
     attempts_total = args.retries + 1
 
@@ -364,19 +543,35 @@ def main(argv: list[str] | None = None) -> int:
                 f"Best offer: ID={best['id']}  GPU={best['gpu_name']} ×{best['num_gpus']}  "
                 f"${best['dph_base']:.3f}/hr"
             )
+            # Resolve bid price: explicit --bid-price > offer min_bid > none
+            bid_price: float | None = None
+            use_interruptable = args.interruptable or args.bid_price is not None
+            if use_interruptable:
+                if args.bid_price is not None:
+                    bid_price = args.bid_price
+                elif best.get("min_bid") is not None:
+                    bid_price = float(best["min_bid"])
+                else:
+                    print(
+                        "ERROR: --interruptable requested but this offer has no min_bid. "
+                        "Specify --bid-price explicitly.",
+                        file=sys.stderr,
+                    )
+                    return 1
+
             print("Creating instance…")
             try:
                 instance_id = create_instance(
                     best["id"],
                     image=args.image,
                     disk_gb=args.disk,
-                    interruptable=args.interruptable,
+                    bid_price=bid_price,
                 )
             except RuntimeError as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)
                 return 1
             created = True
-            interruptable_note = " (interruptable)" if args.interruptable else ""
+            interruptable_note = f" (interruptable, bid=${bid_price:.3f}/hr)" if bid_price is not None else ""
             print(f"Instance {instance_id} created{interruptable_note}. Waiting for it to start…")
 
         interrupted = False

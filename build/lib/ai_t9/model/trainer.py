@@ -429,6 +429,9 @@ class _BaseTrainer:
         self._scheduler = None
         self._scaler = None
         self._objective: TrainingObjective | None = None
+        self._current_shard: int = -1
+        self._current_shard_order: list | None = None
+        self._checkpoint_data: dict | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -466,7 +469,7 @@ class _BaseTrainer:
         self._before_training()
         self._train(sentences, epochs=epochs, torch=torch, verbose=verbose, checkpoint_path=checkpoint_path)
 
-    def train_from_pairs_file(self, pairs_path: str | Path, epochs: int = 3, verbose: bool = True, checkpoint_path: str | Path | None = None) -> None:
+    def train_from_pairs_file(self, pairs_path: str | Path, epochs: int = 3, verbose: bool = True, checkpoint_path: str | Path | None = None, on_checkpoint=None) -> None:
         """Train directly from a precomputed pairs .npz file."""
         torch = _require_torch()
         if verbose:
@@ -479,7 +482,7 @@ class _BaseTrainer:
         if verbose:
             print(f"  {len(pos_np):,} pairs loaded")
         self._before_training()
-        self._train_from_arrays(ctx_np, pos_np, epochs=epochs, torch=torch, verbose=verbose, checkpoint_path=checkpoint_path)
+        self._train_from_arrays(ctx_np, pos_np, epochs=epochs, torch=torch, verbose=verbose, checkpoint_path=checkpoint_path, on_checkpoint=on_checkpoint)
 
     def train_from_pairs_dir(
         self,
@@ -489,6 +492,7 @@ class _BaseTrainer:
         prefetch: bool = True,
         verbose: bool = True,
         checkpoint_path: str | Path | None = None,
+        on_checkpoint=None,
     ) -> None:
         """Train from a directory of sharded pairs .npz files.
 
@@ -498,11 +502,14 @@ class _BaseTrainer:
         and compute.
 
         Args:
-            pairs_dir: Directory containing shard files.
-            pattern:   Glob pattern to match shard files (default ``pairs_*.npz``).
-            epochs:    Number of full passes over all shards.
-            prefetch:  Overlap CPU I/O with GPU compute via background thread.
-            verbose:   Print progress.
+            pairs_dir:       Directory containing shard files.
+            pattern:         Glob pattern to match shard files (default ``pairs_*.npz``).
+            epochs:          Number of full passes over all shards.
+            prefetch:        Overlap CPU I/O with GPU compute via background thread.
+            verbose:         Print progress.
+            checkpoint_path: Local path to save checkpoint after each shard/epoch.
+            on_checkpoint:   Optional ``(path: Path) -> None`` called after each
+                             local checkpoint save (e.g. to upload to S3).
         """
         torch = _require_torch()
         shard_paths = sorted(Path(pairs_dir).glob(pattern))
@@ -511,7 +518,10 @@ class _BaseTrainer:
         if verbose:
             print(f"Found {len(shard_paths)} shard(s) in {pairs_dir}")
         self._before_training()
-        self._train_from_shards(shard_paths, epochs=epochs, torch=torch, prefetch=prefetch, verbose=verbose)
+        self._train_from_shards(
+            shard_paths, epochs=epochs, torch=torch, prefetch=prefetch, verbose=verbose,
+            checkpoint_path=checkpoint_path, on_checkpoint=on_checkpoint,
+        )
 
     # ------------------------------------------------------------------
     # Hooks for subclasses
@@ -538,6 +548,52 @@ class _BaseTrainer:
         Must be implemented by subclasses.
         """
         raise NotImplementedError
+
+    def save_checkpoint(self, path: str | Path) -> None:
+        """Save training state atomically (write temp + rename) to *path*."""
+        torch = _require_torch()
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "epoch": self._epoch,
+            "shard": self._current_shard,
+            "global_step": self._global_step,
+            "model_state_dict": self._model.state_dict() if self._model is not None else None,
+            "optimizer_state_dict": self._optimizer.state_dict() if self._optimizer is not None else None,
+            "scheduler_state_dict": self._scheduler.state_dict() if self._scheduler is not None else None,
+            "scaler_state_dict": self._scaler.state_dict() if self._scaler is not None else None,
+            "shard_order_names": (
+                [Path(p).name for p in self._current_shard_order]
+                if self._current_shard_order is not None else None
+            ),
+            "vocab_size": self._vocab.size,
+            "embed_dim": self._embed_dim,
+        }
+        tmp_path = path.with_suffix(".tmp")
+        torch.save(state, tmp_path)
+        tmp_path.replace(path)
+
+    def load_checkpoint(self, path: str | Path) -> None:
+        """Load training state from *path* into this trainer.
+
+        State is applied lazily: model/optimiser weights are restored inside
+        ``_train_from_arrays`` / ``_train_from_shards`` once the model has been
+        built.  This method just reads the file and caches it.
+        """
+        torch = _require_torch()
+        path = Path(path)
+        if not path.exists():
+            return
+        data = torch.load(path, map_location="cpu", weights_only=False)
+        if "vocab_size" in data and data["vocab_size"] != self._vocab.size:
+            raise ValueError(
+                f"Checkpoint vocab_size={data['vocab_size']} does not match "
+                f"current vocab_size={self._vocab.size}. "
+                "Use a checkpoint built from the same vocabulary."
+            )
+        self._checkpoint_data = data
+        self._epoch = data.get("epoch", 0)
+        self._global_step = data.get("global_step", 0)
 
     # ------------------------------------------------------------------
     # Internal training
@@ -574,7 +630,7 @@ class _BaseTrainer:
 
         return device, is_cuda, amp_dtype, scaler
 
-    def _train_from_arrays(self, ctx_np, pos_np, epochs, torch, verbose, checkpoint_path=None):
+    def _train_from_arrays(self, ctx_np, pos_np, epochs, torch, verbose, checkpoint_path=None, on_checkpoint=None):
         """Core epoch/batch training loop operating on preloaded numpy pair arrays."""
         try:
             from tqdm import tqdm as _tqdm
@@ -604,11 +660,9 @@ class _BaseTrainer:
         # regardless of torch.compile graph boundaries.
         embed_fn = getattr(model, 'embed_tgt_words', None)
 
-        # Load checkpoint if available
-        if hasattr(self, '_checkpoint_data') and self._checkpoint_data:
+        # Restore model from checkpoint
+        if self._checkpoint_data is not None and self._checkpoint_data.get('model_state_dict'):
             self._model.load_state_dict(self._checkpoint_data['model_state_dict'])
-            self._epoch = self._checkpoint_data.get('epoch', 0)
-            self._global_step = self._checkpoint_data.get('global_step', 0)
 
         n_pairs = len(pos_np)
         n_batches = n_pairs // self._batch_size
@@ -625,14 +679,15 @@ class _BaseTrainer:
         self._scheduler = scheduler
         self._scaler = scaler
 
-        # Load optimizer/scheduler states if checkpoint
-        if hasattr(self, '_checkpoint_data') and self._checkpoint_data:
-            if 'optimizer_state_dict' in self._checkpoint_data and self._checkpoint_data['optimizer_state_dict']:
-                self._optimizer.load_state_dict(self._checkpoint_data['optimizer_state_dict'])
-            if 'scheduler_state_dict' in self._checkpoint_data and self._checkpoint_data['scheduler_state_dict']:
-                self._scheduler.load_state_dict(self._checkpoint_data['scheduler_state_dict'])
-            if 'scaler_state_dict' in self._checkpoint_data and self._checkpoint_data['scaler_state_dict'] and self._scaler:
-                self._scaler.load_state_dict(self._checkpoint_data['scaler_state_dict'])
+        # Restore optimizer/scheduler/scaler from checkpoint
+        if self._checkpoint_data is not None:
+            cd = self._checkpoint_data
+            if cd.get('optimizer_state_dict'):
+                self._optimizer.load_state_dict(cd['optimizer_state_dict'])
+            if cd.get('scheduler_state_dict'):
+                self._scheduler.load_state_dict(cd['scheduler_state_dict'])
+            if cd.get('scaler_state_dict') and self._scaler is not None:
+                self._scaler.load_state_dict(cd['scaler_state_dict'])
 
         if verbose:
             print(f"  [{time.strftime('%H:%M:%S')}] Transferring {(ctx_np.nbytes + pos_np.nbytes) / 1e6:.0f} MB of pairs to {device}…", flush=True)
@@ -689,6 +744,7 @@ class _BaseTrainer:
                 )
 
             optimizer.zero_grad(set_to_none=True)
+            t_loop = time.monotonic()
 
             for b in batch_range:
                 start = b * self._batch_size
@@ -728,9 +784,12 @@ class _BaseTrainer:
                     # Sync for tqdm only every ~20 optimizer steps rather than
                     # every batch — avoids stalling the GPU pipeline.
                     if _tqdm is not None and display_step % 20 == 0:
-                        batch_range.set_postfix(
-                            loss=f"{running_loss.item() / (b + 1):.4f}"
-                        )
+                        elapsed_loop = time.monotonic() - t_loop
+                        p_s = (b + 1) * self._batch_size / elapsed_loop if elapsed_loop > 0 else 0
+                        batch_range.set_postfix({
+                            "loss": f"{running_loss.item() / (b + 1):.4f}",
+                            "p/s": f"{p_s:,.0f}",
+                        })
 
             elapsed = time.monotonic() - t_epoch
             avg_loss = running_loss.item() / max(n_batches, 1)  # one sync per epoch
@@ -741,19 +800,33 @@ class _BaseTrainer:
                     f"time={elapsed:.1f}s  ({pairs_per_sec:,.0f} pairs/s)"
                 )
 
+            self._global_step = global_step
             if checkpoint_path:
                 self.save_checkpoint(checkpoint_path)
+                if on_checkpoint is not None:
+                    on_checkpoint(Path(checkpoint_path))
 
         self._global_step = global_step
 
         if verbose:
             _log_training_complete(t_train)
 
-    def _train_from_shards(self, shard_paths, epochs, torch, prefetch, verbose):
-        """Epoch loop over sharded pairs files with optional prefetch."""
+    def _train_from_shards(self, shard_paths, epochs, torch, prefetch, verbose, checkpoint_path=None, on_checkpoint=None):
+        """Epoch loop over sharded pairs files with optional prefetch and checkpointing.
+
+        Checkpointing protocol:
+          - ``checkpoint_path`` is the local ``.pt`` file updated after every shard.
+          - ``on_checkpoint(path)`` is called immediately after each local save (e.g.
+            to upload to S3).
+          - On resume, the trainer's ``_epoch`` / ``_checkpoint_data`` (set by
+            ``load_checkpoint``) determine where to restart.  The saved shard order
+            is restored for partial-epoch resumption so the skipped shards are
+            correctly identified.
+        """
         assert self._objective is not None
 
         device, is_cuda, amp_dtype, scaler = self._setup_device_and_amp(torch)
+        self._scaler = scaler
         self._objective.setup(device)
         self._batch_size = _resolve_batch_size(
             self._batch_size, torch, device,
@@ -767,6 +840,10 @@ class _BaseTrainer:
         embed_fn = getattr(model, 'embed_tgt_words', None)
         if verbose:
             print(f"  [{time.strftime('%H:%M:%S')}] Model ready in {time.monotonic() - t_build:.1f}s", flush=True)
+
+        # Restore model weights from checkpoint (must happen before optimizer)
+        if self._checkpoint_data is not None and self._checkpoint_data.get('model_state_dict'):
+            model.load_state_dict(self._checkpoint_data['model_state_dict'])
 
         # Estimate total steps from the first shard.
         if verbose:
@@ -786,27 +863,75 @@ class _BaseTrainer:
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer, _make_lr_lambda(total_steps, warmup_steps, self._min_lr_frac)
         )
+        self._optimizer = optimizer
+        self._scheduler = scheduler
+
+        # Restore optimizer/scheduler/scaler from checkpoint
+        if self._checkpoint_data is not None:
+            cd = self._checkpoint_data
+            if cd.get('optimizer_state_dict'):
+                optimizer.load_state_dict(cd['optimizer_state_dict'])
+            if cd.get('scheduler_state_dict'):
+                scheduler.load_state_dict(cd['scheduler_state_dict'])
+            if cd.get('scaler_state_dict') and scaler is not None:
+                scaler.load_state_dict(cd['scaler_state_dict'])
+
+        # Determine resume point from checkpoint
+        ckpt_shard = -1 if self._checkpoint_data is None else self._checkpoint_data.get("shard", -1)
+        # _epoch set by load_checkpoint. If last checkpoint was a full epoch (shard==-1),
+        # start the next epoch; if mid-epoch, resume the same epoch.
+        start_epoch = self._epoch + 1 if ckpt_shard == -1 else self._epoch
+        if start_epoch > epochs:
+            if verbose:
+                print(f"  Checkpoint at epoch {self._epoch}/{epochs} — training already complete.", flush=True)
+            return
+
+        # If resuming mid-epoch, restore the exact shard order so we can skip done shards.
+        resume_shard_idx = 0
+        ckpt_shard_order: list | None = None
+        if self._checkpoint_data is not None and ckpt_shard >= 0:
+            resume_shard_idx = ckpt_shard + 1
+            saved_names = self._checkpoint_data.get("shard_order_names")
+            if saved_names:
+                name_to_path = {p.name: p for p in shard_paths}
+                ckpt_shard_order = [name_to_path[n] for n in saved_names if n in name_to_path]
 
         if verbose:
             print(f"  [{time.strftime('%H:%M:%S')}] Starting training  "
                   f"(first batch triggers torch.compile kernel build — may take several minutes)", flush=True)
 
         t_train = time.monotonic()
-        global_step = 0
+        global_step = self._global_step
 
-        for epoch in range(1, epochs + 1):
-            shard_order = list(shard_paths)
-            random.shuffle(shard_order)
+        for epoch in range(start_epoch, epochs + 1):
+            # Restore or generate shard order for this epoch.
+            if epoch == start_epoch and ckpt_shard_order is not None:
+                shard_order = ckpt_shard_order
+            else:
+                shard_order = list(shard_paths)
+                random.shuffle(shard_order)
+
+            self._current_shard_order = shard_order
+
+            # Skip shards already completed in a partial epoch resume.
+            skip_count = resume_shard_idx if epoch == start_epoch else 0
+            effective_order = shard_order[skip_count:]
+
+            if skip_count > 0 and verbose:
+                print(f"  [{time.strftime('%H:%M:%S')}] Epoch {epoch}/{epochs}  "
+                      f"resuming from shard {skip_count + 1}/{len(shard_order)} (checkpoint restore)", flush=True)
+
             epoch_loss = 0.0
             epoch_batches = 0
-
             prefetch_result: list = [None]
             prefetch_thread: threading.Thread | None = None
 
             def _load_shard(path, out):
                 out[0] = load_pairs(path, context_window=self._context_window, vocab_size=self._vocab.size)
 
-            for si, shard_path in enumerate(shard_order):
+            for si_rel, shard_path in enumerate(effective_order):
+                si = skip_count + si_rel  # absolute shard index in full epoch order
+
                 # Wait for prefetch if active, otherwise load directly.
                 if prefetch_thread is not None:
                     prefetch_thread.join()
@@ -822,10 +947,10 @@ class _BaseTrainer:
                           f"shard {si + 1}/{len(shard_order)}  {len(pos_np):,} pairs", flush=True)
 
                 # Start prefetch of next shard.
-                if prefetch and si + 1 < len(shard_order):
+                if prefetch and si_rel + 1 < len(effective_order):
                     prefetch_result = [None]
                     prefetch_thread = threading.Thread(
-                        target=_load_shard, args=(shard_order[si + 1], prefetch_result), daemon=True
+                        target=_load_shard, args=(effective_order[si_rel + 1], prefetch_result), daemon=True
                     )
                     prefetch_thread.start()
                 else:
@@ -845,6 +970,24 @@ class _BaseTrainer:
                     pairs_per_sec = len(pos_np) / shard_elapsed if shard_elapsed > 0 else 0
                     print(f"  [{time.strftime('%H:%M:%S')}] Shard done in {shard_elapsed:.1f}s  "
                           f"({pairs_per_sec:,.0f} pairs/s)", flush=True)
+
+                # Save checkpoint after each shard.
+                self._current_shard = si
+                self._epoch = epoch
+                self._global_step = global_step
+                if checkpoint_path:
+                    self.save_checkpoint(checkpoint_path)
+                    if on_checkpoint is not None:
+                        on_checkpoint(Path(checkpoint_path))
+
+            # Epoch complete — shard=-1 signals a full epoch boundary.
+            self._current_shard = -1
+            self._epoch = epoch
+            self._global_step = global_step
+            if checkpoint_path:
+                self.save_checkpoint(checkpoint_path)
+                if on_checkpoint is not None:
+                    on_checkpoint(Path(checkpoint_path))
 
             if verbose:
                 print(f"  Epoch {epoch}/{epochs}  loss={epoch_loss / max(epoch_batches, 1):.4f}")
@@ -889,6 +1032,8 @@ class _BaseTrainer:
                 leave=False,
             )
 
+        t_loop = time.monotonic()
+
         for b in batch_range:
             start = b * self._batch_size
             idx = perm[start:start + self._batch_size]
@@ -924,7 +1069,12 @@ class _BaseTrainer:
                 global_step += 1
                 display_step += 1
                 if _tqdm is not None and display_step % 20 == 0:
-                    batch_range.set_postfix(loss=f"{running_loss.item() / (b + 1):.4f}")
+                    elapsed_loop = time.monotonic() - t_loop
+                    p_s = (b + 1) * self._batch_size / elapsed_loop if elapsed_loop > 0 else 0
+                    batch_range.set_postfix({
+                        "loss": f"{running_loss.item() / (b + 1):.4f}",
+                        "p/s": f"{p_s:,.0f}",
+                    })
 
         del ctx_dev, pos_dev
         return running_loss.item(), n_batches, global_step

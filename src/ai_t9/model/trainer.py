@@ -30,6 +30,7 @@ from __future__ import annotations
 import io
 import math
 import random
+import re
 import shutil
 import threading
 import time
@@ -139,8 +140,18 @@ def _resolve_batch_size(
 # Corpus iterator helpers
 # ---------------------------------------------------------------------------
 
+# Split on sentence-ending punctuation followed by whitespace.
+# This prevents context windows from spanning sentence boundaries when a
+# corpus file contains multiple sentences per line (paragraphs, etc.).
+_SENT_BOUNDARY_RE = re.compile(r"[.!?]+\s+")
+
+
 def _corpus_file_sentence_ids(path: Path, vocab: Vocabulary) -> list[list[int]]:
-    """Read a plain-text file (one sentence per line) and convert to word IDs.
+    """Read a plain-text file and convert to per-sentence word-ID lists.
+
+    Lines are split on sentence-ending punctuation so that context windows
+    never cross sentence boundaries — e.g. a paragraph on one line is split
+    into individual sentences before pair generation.
 
     UNK tokens (ID 0) are excluded so they never appear as training
     targets or pollute context windows.
@@ -149,11 +160,15 @@ def _corpus_file_sentence_ids(path: Path, vocab: Vocabulary) -> list[list[int]]:
     unk = vocab.UNK_ID
     with path.open(encoding="utf-8", errors="ignore") as f:
         for line in f:
-            words = line.strip().lower().split()
-            ids = [vocab.word_to_id(w) for w in words if w.isalpha()]
-            ids = [wid for wid in ids if wid != unk]
-            if len(ids) >= 2:
-                sentences.append(ids)
+            line = line.strip().lower()
+            if not line:
+                continue
+            for sent_text in _SENT_BOUNDARY_RE.split(line):
+                words = [w for w in sent_text.split() if w.isalpha()]
+                ids = [vocab.word_to_id(w) for w in words]
+                ids = [wid for wid in ids if wid != unk]
+                if len(ids) >= 2:
+                    sentences.append(ids)
     return sentences
 
 
@@ -161,6 +176,7 @@ def _precompute_pairs(
     sentences: list[list[int]],
     context_window: int,
     verbose: bool = False,
+    subsample_probs: "np.ndarray | None" = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Pre-compute all (context, target) training pairs as flat NumPy arrays.
 
@@ -173,6 +189,12 @@ def _precompute_pairs(
 
     Uses vectorised NumPy operations per sentence (stride-trick context
     windows + boolean masking) instead of element-by-element Python writes.
+
+    Args:
+        subsample_probs: optional float32 (vocab_size,) array where entry i is
+            the keep-probability for word_id i.  When supplied, each word
+            occurrence is independently kept with that probability before pairs
+            are generated (Word2Vec-style frequent-word subsampling).
 
     Returns:
         ctx_arr: int64 (n_pairs, context_window) — zero-padded on the left
@@ -188,11 +210,24 @@ def _precompute_pairs(
     n_sents = len(sentences)
     report_interval = max(1, n_sents // 100)
 
+    rng = np.random.default_rng()
+
     for si, sent in enumerate(sentences):
-        n = len(sent)
-        if n < 2:
+        if len(sent) < 2:
             continue
         arr = np.array(sent, dtype=np.int64)
+
+        # Frequent-word subsampling: stochastically discard word occurrences
+        # with probability 1 - subsample_probs[word_id].  This reduces the
+        # dominance of high-frequency function words (the, a, is, …) and
+        # provides the same speedup and quality improvement as Word2Vec's -sample.
+        if subsample_probs is not None:
+            keep = rng.random(len(arr)) < subsample_probs[arr]
+            arr = arr[keep]
+            if len(arr) < 2:
+                continue
+
+        n = len(arr)
 
         # Boolean mask: which targets (positions 1..n-1) are non-UNK?
         targets = arr[1:]
@@ -242,49 +277,129 @@ def save_pairs(
     path: str | Path,
     verbose: bool = False,
     max_shard_pairs: int | None = None,
+    subsample_probs: "np.ndarray | None" = None,
 ) -> int:
     """Precompute training pairs from sentences and persist them to .npz file(s).
 
     When ``max_shard_pairs`` is None (default), writes a single file at ``path``.
     When set, writes sharded files named ``path_000.npz``, ``path_001.npz``, …
-    each containing at most ``max_shard_pairs`` rows — useful for corpora too
-    large to fit in RAM or GPU VRAM at once.
+    each containing at most ``max_shard_pairs`` rows.  Unlike the single-file
+    path, sharding is done in a **streaming** fashion — only one shard's worth
+    of pairs is held in memory at a time, making it safe for arbitrarily large
+    corpora.
 
     The file(s) store arrays as int32 (half the size of int64) and embed
-    ``context_window`` and ``vocab_size`` as metadata so ``load_pairs()``
-    can detect stale files built from a different vocab or window setting.
+    ``context_window``, ``vocab_size``, and ``n_pairs`` as metadata so
+    ``load_pairs()`` can detect stale files and the LR scheduler can size
+    itself accurately without loading all pair data.
+
+    Args:
+        subsample_probs: optional (vocab_size,) keep-probability array for
+            Word2Vec-style frequent-word subsampling.  Built by
+            ``_BaseTrainer._compute_subsample_probs()``.
 
     Returns the total number of pairs written.
     """
-    ctx_arr, pos_arr = _precompute_pairs(sentences, context_window, verbose=verbose)
-    n_total = len(pos_arr)
-
     if max_shard_pairs is None:
-        # Single-file path (original behaviour).
+        # Single-file path: materialise all pairs then write once.
+        ctx_arr, pos_arr = _precompute_pairs(
+            sentences, context_window, verbose=verbose, subsample_probs=subsample_probs,
+        )
+        n_total = len(pos_arr)
         _write_pairs_npz(ctx_arr, pos_arr, context_window, vocab_size, path)
         if verbose:
             p = Path(path) if str(path).endswith(".npz") else Path(str(path) + ".npz")
             print(f"  Saved {n_total:,} pairs → {p}  ({p.stat().st_size / 1e6:.1f} MB)")
         return n_total
 
-    # Sharded path.
+    # Sharded path: stream sentence-by-sentence and flush shards as they fill.
+    # This keeps at most max_shard_pairs pairs in memory at a time, making it
+    # suitable for corpora too large to fit in RAM.
     path = Path(path)
     stem = path.stem if path.suffix == ".npz" else path.name
     parent = path.parent
+    _UNK = 0
+    rng = np.random.default_rng()
+
     shard = 0
-    written = 0
-    while written < n_total:
-        end = min(written + max_shard_pairs, n_total)
+    ctx_buf: list[np.ndarray] = []
+    pos_buf: list[np.ndarray] = []
+    buf_size = 0
+    total = 0
+    n_sents = len(sentences)
+    report_interval = max(1, n_sents // 100)
+
+    if verbose:
+        print("Precomputing training pairs (streaming shards)...")
+
+    for si, sent in enumerate(sentences):
+        if len(sent) < 2:
+            continue
+        arr = np.array(sent, dtype=np.int64)
+
+        if subsample_probs is not None:
+            keep = rng.random(len(arr)) < subsample_probs[arr]
+            arr = arr[keep]
+            if len(arr) < 2:
+                continue
+
+        n = len(arr)
+        targets = arr[1:]
+        mask = targets != _UNK
+        if not mask.any():
+            continue
+
+        padded = np.empty(context_window + n, dtype=np.int64)
+        padded[:context_window] = 0
+        padded[context_window:] = arr
+        windows = np.lib.stride_tricks.sliding_window_view(padded, window_shape=context_window)
+        valid_t = np.where(mask)[0] + 1
+        ctx_buf.append(windows[valid_t].copy())
+        pos_buf.append(arr[valid_t])
+        buf_size += len(valid_t)
+
+        # Flush completed shards from the buffer.
+        while buf_size >= max_shard_pairs:
+            ctx_all = np.concatenate(ctx_buf)
+            pos_all = np.concatenate(pos_buf)
+            shard_path = parent / f"{stem}_{shard:03d}.npz"
+            _write_pairs_npz(
+                ctx_all[:max_shard_pairs], pos_all[:max_shard_pairs],
+                context_window, vocab_size, shard_path,
+            )
+            if verbose:
+                print(f"  Shard {shard}: {max_shard_pairs:,} pairs → {shard_path}")
+            total += max_shard_pairs
+            shard += 1
+            remainder_ctx = ctx_all[max_shard_pairs:]
+            remainder_pos = pos_all[max_shard_pairs:]
+            ctx_buf = [remainder_ctx] if len(remainder_ctx) > 0 else []
+            pos_buf = [remainder_pos] if len(remainder_pos) > 0 else []
+            buf_size = len(remainder_pos)
+
+        if verbose and si % report_interval == 0:
+            frac = (si + 1) / n_sents
+            bar_w = 20
+            filled = int(bar_w * frac)
+            bar = "\u2588" * filled + "\u2591" * (bar_w - filled)
+            print(
+                f"\r  |{bar}| {si + 1}/{n_sents} sentences ({total + buf_size:,} pairs)",
+                end="", flush=True,
+            )
+
+    # Flush any remaining pairs as the final (partial) shard.
+    if buf_size > 0:
+        ctx_all = np.concatenate(ctx_buf)
+        pos_all = np.concatenate(pos_buf)
         shard_path = parent / f"{stem}_{shard:03d}.npz"
-        _write_pairs_npz(
-            ctx_arr[written:end], pos_arr[written:end],
-            context_window, vocab_size, shard_path,
-        )
+        _write_pairs_npz(ctx_all, pos_all, context_window, vocab_size, shard_path)
         if verbose:
-            print(f"  Shard {shard}: {end - written:,} pairs → {shard_path}")
-        written = end
-        shard += 1
-    return n_total
+            print(f"\r  Shard {shard}: {len(pos_all):,} pairs → {shard_path}" + " " * 20)
+        total += len(pos_all)
+    elif verbose:
+        print()
+
+    return total
 
 
 def _write_pairs_npz(
@@ -298,6 +413,8 @@ def _write_pairs_npz(
 
     Writing via BytesIO avoids random seeks, which is incompatible with S3
     CloudBucketMounts (Mountpoint only supports sequential writes).
+    The ``n_pairs`` scalar is stored as metadata so shard pair counts can be
+    read without decompressing the full arrays (used for LR schedule sizing).
     """
     buf = io.BytesIO()
     np.savez(
@@ -306,6 +423,7 @@ def _write_pairs_npz(
         pos=pos_arr.astype(np.int32),
         vocab_size=np.array(vocab_size, dtype=np.int64),
         context_window=np.array(context_window, dtype=np.int64),
+        n_pairs=np.array(len(pos_arr), dtype=np.int64),
     )
     buf.seek(0)
     path = Path(path)
@@ -314,6 +432,20 @@ def _write_pairs_npz(
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
         shutil.copyfileobj(buf, f)
+
+
+def _get_shard_n_pairs(path: str | Path) -> int:
+    """Return the pair count stored in a shard's metadata without loading arrays.
+
+    NumPy's NpzFile is lazy — only the requested entry is decompressed.
+    Reading the tiny ``n_pairs`` scalar is therefore very fast even for
+    large shards.  Falls back to loading ``pos`` if the key is absent
+    (old-format shards written before this metadata was added).
+    """
+    data = np.load(path)
+    if "n_pairs" in data:
+        return int(data["n_pairs"])
+    return len(data["pos"])  # backward-compat: load full array
 
 
 def load_pairs(
@@ -408,6 +540,7 @@ class _BaseTrainer:
         seed: int = 42,
         device: str = "auto",
         debug: bool = False,
+        subsample_threshold: float = 1e-4,
     ) -> None:
         self._vocab = vocab
         self._embed_dim = embed_dim
@@ -422,6 +555,7 @@ class _BaseTrainer:
         self._seed = seed
         self._device_pref = device
         self._debug = debug
+        self._subsample_threshold = subsample_threshold
         self._model = None
         self._epoch = 0
         self._global_step = 0
@@ -432,6 +566,33 @@ class _BaseTrainer:
         self._current_shard: int = -1
         self._current_shard_order: list | None = None
         self._checkpoint_data: dict | None = None
+
+    def _compute_subsample_probs(self) -> "np.ndarray | None":
+        """Compute per-word keep-probabilities for frequent-word subsampling.
+
+        For each word w with corpus frequency f(w), the keep probability is::
+
+            P(keep w) = min(1.0, sqrt(t / f(w)))
+
+        where t = subsample_threshold (default 1e-4).  Words with f(w) <= t are
+        always kept; frequent words are stochastically down-sampled.  This is
+        Word2Vec's ``-sample`` mechanism, which reduces the dominance of function
+        words and speeds up training by generating fewer pairs.
+
+        Returns None when subsample_threshold <= 0 (subsampling disabled).
+        """
+        t = self._subsample_threshold
+        if t <= 0:
+            return None
+        counts = self._vocab.counts
+        total = max(sum(counts), 1)
+        probs = np.ones(self._vocab.size, dtype=np.float32)
+        for wid in range(1, self._vocab.size):  # skip UNK
+            freq = counts[wid] / total
+            if freq > 0:
+                probs[wid] = min(1.0, math.sqrt(t / freq))
+        probs[0] = 0.0  # UNK always discarded (already excluded elsewhere)
+        return probs
 
     # ------------------------------------------------------------------
     # Public API
@@ -600,8 +761,13 @@ class _BaseTrainer:
     # ------------------------------------------------------------------
 
     def _train(self, sentences, epochs, torch, verbose, checkpoint_path=None):
-        ctx_np, pos_np = _precompute_pairs(sentences, self._context_window, verbose=verbose)
-        self._before_training()
+        # _before_training() is called by the public API methods (train_from_*)
+        # before reaching here — do NOT call it again.
+        subsample_probs = self._compute_subsample_probs()
+        ctx_np, pos_np = _precompute_pairs(
+            sentences, self._context_window, verbose=verbose,
+            subsample_probs=subsample_probs,
+        )
         self._train_from_arrays(ctx_np, pos_np, epochs=epochs, torch=torch, verbose=verbose, checkpoint_path=checkpoint_path)
 
     def _setup_device_and_amp(self, torch):
@@ -643,17 +809,21 @@ class _BaseTrainer:
 
         device, is_cuda, amp_dtype, scaler = self._setup_device_and_amp(torch)
         self._objective.setup(device)
-        self._batch_size = _resolve_batch_size(
-            self._batch_size, torch, device,
-            objective=self._objective, verbose=verbose,
-        )
 
+        # Build the model FIRST so its VRAM footprint is reflected when
+        # auto-sizing the batch (the model consumes a significant fraction
+        # of GPU memory before pairs are transferred).
         t_build = time.monotonic()
         model, compiled = self._build_model(torch, device)
         self._model = model
         model.train()
         if verbose:
             print(f"  [{time.strftime('%H:%M:%S')}] Model ready in {time.monotonic() - t_build:.1f}s", flush=True)
+
+        self._batch_size = _resolve_batch_size(
+            self._batch_size, torch, device,
+            objective=self._objective, verbose=verbose,
+        )
 
         # embed_fn for objectives that need to embed extra word IDs (e.g. SGNS
         # negative sampling).  Compiled separately from the forward pass so the
@@ -734,8 +904,17 @@ class _BaseTrainer:
         t_train = time.monotonic()
         global_step = self._global_step
 
-        for epoch in range(self._epoch + 1, self._epoch + epochs + 1):
+        # Fix epoch range: capture start/end before the loop so the tqdm
+        # description and verbose print always show the correct denominator.
+        start_epoch = self._epoch + 1
+        end_epoch = self._epoch + epochs
+
+        for epoch in range(start_epoch, end_epoch + 1):
             self._epoch = epoch
+            # Synchronise before starting the timer so async CUDA ops from any
+            # prior work are flushed and don't inflate this epoch's elapsed time.
+            if is_cuda:
+                torch.cuda.synchronize(device)
             t_epoch = time.monotonic()
             # Accumulate loss on GPU to avoid a blocking GPU→CPU sync every batch.
             # A single .item() call per epoch (at reporting time) is all we need.
@@ -747,7 +926,7 @@ class _BaseTrainer:
             if _tqdm is not None:
                 batch_range = _tqdm(
                     batch_range,
-                    desc=f"Epoch {epoch}/{self._epoch + epochs - 1}",
+                    desc=f"Epoch {epoch}/{end_epoch}",
                     unit="batch",
                     leave=False,
                 )
@@ -803,12 +982,14 @@ class _BaseTrainer:
                             "p/s": f"{p_s:,.0f}",
                         })
 
+            if is_cuda:
+                torch.cuda.synchronize(device)
             elapsed = time.monotonic() - t_epoch
             avg_loss = running_loss.item() / max(n_batches, 1)  # one sync per epoch
             pairs_per_sec = n_pairs / elapsed if elapsed > 0 else 0
             if verbose:
                 print(
-                    f"  Epoch {epoch}/{self._epoch + epochs - 1}  loss={avg_loss:.4f}  "
+                    f"  Epoch {epoch}/{end_epoch}  loss={avg_loss:.4f}  "
                     f"time={elapsed:.1f}s  ({pairs_per_sec:,.0f} pairs/s)"
                 )
 
@@ -840,11 +1021,9 @@ class _BaseTrainer:
         device, is_cuda, amp_dtype, scaler = self._setup_device_and_amp(torch)
         self._scaler = scaler
         self._objective.setup(device)
-        self._batch_size = _resolve_batch_size(
-            self._batch_size, torch, device,
-            objective=self._objective, verbose=verbose,
-        )
 
+        # Build the model FIRST so its VRAM footprint is visible when
+        # auto-sizing the batch.
         t_build = time.monotonic()
         model, compiled = self._build_model(torch, device)
         self._model = model
@@ -862,13 +1041,29 @@ class _BaseTrainer:
         if verbose:
             print(f"  [{time.strftime('%H:%M:%S')}] Model ready in {time.monotonic() - t_build:.1f}s", flush=True)
 
+        self._batch_size = _resolve_batch_size(
+            self._batch_size, torch, device,
+            objective=self._objective, verbose=verbose,
+        )
+
         # Restore model weights from checkpoint (must happen before optimizer)
         if self._checkpoint_data is not None and self._checkpoint_data.get('model_state_dict'):
             model.load_state_dict(self._checkpoint_data['model_state_dict'])
 
-        # Estimate total steps from the first shard.
+        # Estimate total training steps using the stored n_pairs metadata from
+        # every shard — this is cheap (reads only a tiny scalar per file) and
+        # correctly accounts for the smaller final shard so the LR cosine
+        # decay ends precisely at the last optimizer step.
         if verbose:
-            print(f"  [{time.strftime('%H:%M:%S')}] Loading first shard for step estimate…", flush=True)
+            print(f"  [{time.strftime('%H:%M:%S')}] Counting pairs across {len(shard_paths)} shard(s)…", flush=True)
+        t_count = time.monotonic()
+        n_pairs_total = sum(_get_shard_n_pairs(p) for p in shard_paths)
+        if verbose:
+            print(f"  [{time.strftime('%H:%M:%S')}] Total pairs: {n_pairs_total:,}  "
+                  f"(counted in {time.monotonic() - t_count:.1f}s)", flush=True)
+        # Load the first shard so it's ready when the training loop starts.
+        if verbose:
+            print(f"  [{time.strftime('%H:%M:%S')}] Pre-loading first shard…", flush=True)
         t_shard0 = time.monotonic()
         first_ctx, first_pos = load_pairs(
             shard_paths[0], context_window=self._context_window, vocab_size=self._vocab.size,
@@ -876,7 +1071,7 @@ class _BaseTrainer:
         if verbose:
             print(f"  [{time.strftime('%H:%M:%S')}] First shard: {len(first_pos):,} pairs  "
                   f"(loaded in {time.monotonic() - t_shard0:.1f}s)", flush=True)
-        n_pairs_estimate = len(first_pos) * len(shard_paths) * epochs
+        n_pairs_estimate = n_pairs_total * epochs
         total_steps = max(1, n_pairs_estimate // (self._batch_size * self._accumulate))
         warmup_steps = int(total_steps * self._warmup_frac)
 
@@ -1154,11 +1349,13 @@ class DualEncoderTrainer(_BaseTrainer):
         n_negatives: int = 15,
         hard_neg_frac: float = 0.5,
         temperature: float = 0.07,
+        subsample_threshold: float = 1e-4,
     ) -> None:
         super().__init__(
             vocab, embed_dim, context_window, lr, weight_decay, warmup_frac,
             min_lr_frac, batch_size, accumulate_grad_batches,
             clip_grad_norm, seed, device, debug,
+            subsample_threshold=subsample_threshold,
         )
         self._ns = ns
         self._ngram_to_id: dict[str, int] | None = None
@@ -1237,7 +1434,7 @@ class DualEncoderTrainer(_BaseTrainer):
             self._objective = spec
         elif spec == "sgns":
             self._objective = SGNSObjective(
-                counts=self._vocab._counts,
+                counts=self._vocab.counts,
                 k=self._n_negatives,
                 t9_groups=self._t9_groups,
                 hard_neg_frac=self._hard_neg_frac,
@@ -1258,7 +1455,9 @@ class DualEncoderTrainer(_BaseTrainer):
         if self._ngram_to_id is not None:
             return
         from .dual_encoder import build_ngram_vocab
-        words = [self._vocab.id_to_word(i) for i in range(self._vocab.size)]
+        # Skip word_id=0 (<unk>): its n-grams would never receive gradient
+        # (UNK is excluded from training targets) and would waste n-gram slots.
+        words = [self._vocab.id_to_word(i) for i in range(1, self._vocab.size)]
         self._ngram_to_id = build_ngram_vocab(words, ns=self._ns)
 
     def _build_word_ngram_table(self, torch) -> "tuple[torch.Tensor, torch.Tensor]":
@@ -1386,7 +1585,15 @@ class DualEncoderTrainer(_BaseTrainer):
                 pos_vecs_ctx = self_.pos_embed(self_._slot_ids)      # (1, W, dim)
                 ctx_input = ctx_word_vecs + pos_vecs_ctx             # (B, W, dim)
 
-                # 3. Mask padding positions (word_id == 0 → zero vector).
+                # 3. Normalise each position's (word + pos) vector to unit norm.
+                #    This decouples the GRU input scale from the relative
+                #    magnitudes of word embeddings (unit-norm) vs positional
+                #    embeddings (unconstrained), preventing either signal from
+                #    dominating the other as training progresses.
+                ctx_input = F.normalize(ctx_input, dim=-1)           # (B, W, dim)
+
+                # 4. Mask padding positions: zero out the normalised padding
+                #    vectors so the GRU treats them as empty slots.
                 pad_mask = (ctx_ids != 0).float().unsqueeze(-1)      # (B, W, 1)
                 ctx_input = ctx_input * pad_mask                     # (B, W, dim)
 

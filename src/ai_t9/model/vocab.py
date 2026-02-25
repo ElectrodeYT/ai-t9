@@ -80,6 +80,11 @@ class Vocabulary:
         return self._logfreq
 
     @property
+    def counts(self) -> list[int]:
+        """Raw corpus count for each word ID (index 0 = UNK, always 0)."""
+        return self._counts
+
+    @property
     def size(self) -> int:
         return len(self._words)
 

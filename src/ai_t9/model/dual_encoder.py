@@ -262,11 +262,18 @@ class DualEncoder:
         # Word vectors (L2-normalised per word from pre-computed matrix).
         word_vecs = self._ctx_matrix[padded_ids].copy()     # (window, dim)
 
-        # Positional embeddings — add before masking so padding adds 0.
+        # Positional embeddings — add before masking.
         if self._pos_embed is not None:
             word_vecs += self._pos_embed                    # (window, dim)
 
-        # Mask out padding positions.
+        # Normalise each position's (word + pos) vector to unit norm so the
+        # GRU always receives unit-norm inputs regardless of the relative
+        # magnitudes of the word and positional embeddings.  Mirrors the
+        # F.normalize() applied in the training forward pass.
+        norms = np.linalg.norm(word_vecs, axis=1, keepdims=True)
+        word_vecs = np.where(norms > 1e-8, word_vecs / norms, word_vecs)
+
+        # Mask out padding positions (zeroes the normalised padding vectors).
         mask = (padded_ids != 0).astype(np.float32)[:, None]  # (window, 1)
         word_vecs *= mask
 
@@ -306,6 +313,11 @@ class DualEncoder:
         if not word:
             return 0.0
         ctx_vec = self.encode_context(context_ids)
+        # Fast path: use the precomputed L2-normalised matrix for in-vocab words.
+        wid = self._vocab.word_to_id(word)
+        if wid != _UNK_NGRAM_ID:
+            return float(self._word_matrix[wid] @ ctx_vec)
+        # OOV path: compute from n-gram embeddings on the fly.
         ids = self._ngram_ids(word)
         if len(ids) == 0 or np.all(ids == _UNK_NGRAM_ID):
             return 0.0
@@ -337,9 +349,17 @@ class DualEncoder:
     # ------------------------------------------------------------------
 
     def quantize_int8(self) -> "DualEncoder":
-        """Return a new DualEncoder with int8-quantized n-gram embeddings (~4× smaller).
+        """Return a new DualEncoder with int8-precision n-gram embeddings.
 
-        GRU weights and positional embeddings are kept in float32.
+        The embeddings are quantized to int8 and immediately dequantized back
+        to float32.  This does **not** reduce runtime memory usage; the benefit
+        is a smaller ``.npz`` file on disk because the rounded float32 values
+        compress better than the originals.  GRU weights and positional
+        embeddings are kept in full float32.
+
+        For actual runtime memory reduction the embedding matrices would need
+        to stay as int8 with on-the-fly dequantization during scoring — that
+        is a more invasive change left as a future enhancement.
         """
         def _quant(arr: np.ndarray) -> np.ndarray:
             scale = np.abs(arr).max(axis=1, keepdims=True).clip(min=1e-8)

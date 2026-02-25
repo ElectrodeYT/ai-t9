@@ -385,29 +385,38 @@ def _normalise(scores: np.ndarray) -> np.ndarray:
     Each score is replaced by its fractional rank: ``rank / (n - 1)`` for
     *n* candidates, producing values in [0, 1] where 1.0 is the highest-
     scoring candidate and 0.0 is the lowest.  Ties receive the mean of the
-    ranks they would span.
+    ranks they would span (equivalent to scipy.stats.rankdata 'average').
 
     With a single candidate (or all-identical scores), returns all zeros.
+    Fully vectorised — no Python loop over tie groups.
     """
     n = len(scores)
     if n <= 1:
         return np.zeros_like(scores)
+
     order = scores.argsort()
-    ranks = np.empty(n, dtype=np.float32)
-    ranks[order] = np.arange(n, dtype=np.float32)
     sorted_scores = scores[order]
-    i = 0
-    while i < n:
-        j = i + 1
-        while j < n and sorted_scores[j] - sorted_scores[i] < 1e-12:
-            j += 1
-        if j > i + 1:
-            avg_rank = np.mean(np.arange(i, j, dtype=np.float32))
-            for idx in range(i, j):
-                ranks[order[idx]] = avg_rank
-        i = j
-    denom = n - 1
-    result = ranks / denom
+
+    # Assign a group ID to each sorted position: a new group starts wherever
+    # consecutive values differ by more than the float32 epsilon.
+    changes = np.empty(n, dtype=bool)
+    changes[0] = True
+    changes[1:] = np.abs(np.diff(sorted_scores)) > 1e-12
+    group_ids = np.cumsum(changes) - 1  # (n,) group index per sorted position
+
+    # Compute the mean rank for each group via bincount (O(n), no Python loop).
+    n_groups = int(group_ids[-1]) + 1
+    group_rank_sum = np.bincount(
+        group_ids, weights=np.arange(n, dtype=np.float64), minlength=n_groups,
+    )
+    group_count = np.bincount(group_ids, minlength=n_groups).astype(np.float64)
+    mean_ranks = (group_rank_sum / group_count).astype(np.float32)
+
+    # Map mean ranks back to original (unsorted) positions.
+    ranks = np.empty(n, dtype=np.float32)
+    ranks[order] = mean_ranks[group_ids]
+
+    result = ranks / (n - 1)
     if result.max() - result.min() < 1e-9:
         return np.zeros(n, dtype=np.float32)
     return result

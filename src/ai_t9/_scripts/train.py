@@ -86,15 +86,19 @@ def _load_hf_texts(args) -> list[str]:
 def _hf_sentence_ids(texts: list[str], vocab) -> list[list[int]]:
     """Convert list of texts to list of sentence ID lists."""
     from nltk.tokenize import sent_tokenize
-    
+
+    unk = vocab.UNK_ID
     sentences = []
     for text in texts:
         for sent in sent_tokenize(text):
-            words = sent.lower().split()
-            ids = vocab.words_to_ids(words)
-            if ids:  # Skip empty sentences
+            # Filter with isalpha() — same as the corpus file reader — to strip
+            # punctuation-attached tokens ("going,", "world.") that would
+            # otherwise map to UNK and pollute the context windows.
+            words = [w for w in sent.lower().split() if w.isalpha()]
+            ids = [wid for wid in vocab.words_to_ids(words) if wid != unk]
+            if len(ids) >= 2:
                 sentences.append(ids)
-    
+
     print(f"  Extracted {len(sentences)} sentences")
     return sentences
 
@@ -220,6 +224,10 @@ def main(argv: list[str] | None = None) -> int:
              "or 'clip' (in-batch negatives, O(B²))",
     )
     parser.add_argument("--n-negatives",    type=int,   default=15,    help="Negative samples per positive for SGNS objective (default: 15)")
+    parser.add_argument("--subsample-threshold", type=float, default=1e-4,
+                        help="Word2Vec-style frequent-word subsampling threshold t. "
+                             "Words with corpus frequency f > t are kept with "
+                             "probability sqrt(t/f). 0 disables subsampling. (default: 1e-4)")
 
     # ---- Batch / accumulation -------------------------------------------
     parser.add_argument("--batch-size",             type=int,   default=0,    help="Pairs per micro-batch. 0 (default) auto-selects based on GPU VRAM; typical auto values are 16384\u2013131072.")
@@ -303,6 +311,7 @@ def main(argv: list[str] | None = None) -> int:
         objective=args.objective,
         n_negatives=args.n_negatives,
         temperature=args.temperature,
+        subsample_threshold=args.subsample_threshold,
     )
 
     # Load checkpoint if exists
@@ -354,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
                 for p in corpus_files:
                     sentences.extend(_corpus_file_sentence_ids(p, vocab))
             pairs_out = Path(args.save_pairs)
+            subsample_probs = trainer._compute_subsample_probs()
             n = save_pairs(
                 sentences,
                 context_window=args.context_window,
@@ -361,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
                 path=pairs_out,
                 verbose=True,
                 max_shard_pairs=args.shard_size,
+                subsample_probs=subsample_probs,
             )
             print(f"Precomputed {n:,} pairs → {pairs_out}")
             if args.pairs_only:
